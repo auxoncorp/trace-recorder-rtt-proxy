@@ -1,0 +1,40 @@
+[package]
+name = "trace-recorder-rtt-proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jon Lamb <jon@auxon.io>"]
+description = "Proxy debug-probe operations and RTT data over the network"
+license = "Apache-2.0"
+repository = "https://github.com/auxoncorp/trace-recorder-rtt-proxy"
+
+[workspace]
+
+[[bin]]
+name = "trc-rtt-proxy"
+path = "src/main.rs"
+
+[dependencies]
+rtt-proxy = { path = "rtt-proxy/" }
+clap = { version = "4.5", features = ["derive", "env", "color"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+exitcode = "1"
+thiserror = "1"
+parking_lot = "0.12"
+serde_json = "1.0"
+serde = { version = "1.0", features=["derive"] }
+derive_more = { version = "1", features = ["display"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+simple_moving_average = "1.0"
+human_bytes = "0.4"
+probe-rs = { git = "https://github.com/auxoncorp/probe-rs.git", branch = "s32k344" }
+
+[profile.release]
+strip="debuginfo"
+
+[dev-dependencies]
+humantime = "2"
+goblin = "0.8"
+clap-num = "1.1"
+url = "2"
