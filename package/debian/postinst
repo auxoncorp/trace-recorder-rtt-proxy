@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" = "configure" ]; then
+    adduser --quiet --system --group --no-create-home --home /nonexistent trc-rtt-proxy
+    adduser trc-rtt-proxy plugdev
+fi
+
+#DEBHELPER#
+
+exit 0

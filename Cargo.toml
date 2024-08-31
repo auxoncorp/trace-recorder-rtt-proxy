@@ -3,7 +3,7 @@ name = "trace-recorder-rtt-proxy"
 version = "0.1.0"
 edition = "2021"
 authors = ["Jon Lamb <jon@auxon.io>"]
-description = "Proxy debug-probe operations and RTT data over the network"
+description = "Proxy debug-probe operations and trace recorder RTT data over the network"
 license = "Apache-2.0"
 repository = "https://github.com/auxoncorp/trace-recorder-rtt-proxy"
 
@@ -38,3 +38,23 @@ humantime = "2"
 goblin = "0.8"
 clap-num = "1.1"
 url = "2"
+
+[package.metadata.deb]
+extended-description = """\
+A server and CLI to proxy debug-probe operations and trace recorder RTT data over the network. \
+
+See https://github.com/auxoncorp/trace-recorder-rtt-proxy for \
+more information."""
+copyright = "2024 Auxon Corporation"
+depends = "$auto, systemd, init-system-helpers (>= 1.5), adduser"
+section = "devel"
+priority = "optional"
+conf-files = ["/etc/default/trace-recorder-rtt-proxy"]
+maintainer-scripts = "package/debian/"
+systemd-units = { enable = true }
+assets = [
+    ["target/release/trc-rtt-proxy", "usr/bin/", "755"],
+    ["target/release/examples/trc-rtt-proxy-client", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/trace-recorder-rtt-proxy/README", "644"],
+    ["package/debian/env", "/etc/default/trace-recorder-rtt-proxy", "644"], 
+]
