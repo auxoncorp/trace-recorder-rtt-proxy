@@ -1,0 +1,124 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable]
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Cache target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo--${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev libftdi1-dev libudev-dev
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          toolchain: ${{ matrix.rust }}
+
+      - name: Clippy
+        run: cargo clippy --all-features -- -W clippy::all -D warnings
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Doc Generation
+        run: cargo doc --bins --examples --all-features --no-deps
+
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable, nightly]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install system packages (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev libftdi1-dev libudev-dev
+
+      - name: Install system packages (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          vcpkg install libftdi1:x64-windows libusb:x64-windows
+
+      - name: Cache target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo--${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          toolchain: ${{ matrix.rust }}
+
+      - name: Build debug binary
+        run: cargo build
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable, nightly]
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install system packages (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev libftdi1-dev libudev-dev
+
+      - name: Install system packages (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          vcpkg install libftdi1:x64-windows libusb:x64-windows
+
+      - name: Cache target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo--${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          toolchain: ${{ matrix.rust }}
+
+      - name: Test
+        run: cargo test --all-features -- --test-threads=1
