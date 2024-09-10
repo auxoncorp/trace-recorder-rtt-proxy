@@ -37,7 +37,7 @@ jobs:
 
   linux_package:
     name: Build Release Package (Linux)
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: ubuntu-22.04
     needs: [check]
     steps:
@@ -54,7 +54,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libusb-1.0-0-dev libftdi1-dev libudev-dev lintian dpkg dpkg-dev liblzma-dev
+          sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev libftdi1-dev libudev-dev lintian dpkg dpkg-dev liblzma-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -95,7 +95,7 @@ jobs:
 
   mac_package:
     name: Build Release Package (Mac)
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: macos-latest
     needs: [check]
     steps:
