@@ -1,6 +1,6 @@
 [package]
 name = "trace-recorder-rtt-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jon Lamb <jon@auxon.io>"]
 description = "Proxy debug-probe operations and trace recorder RTT data over the network"
@@ -28,7 +28,7 @@ derive_more = { version = "1", features = ["display"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 simple_moving_average = "1.0"
 human_bytes = "0.4"
-probe-rs = { git = "https://github.com/auxoncorp/probe-rs.git", branch = "s32k344" }
+probe-rs = { git = "https://github.com/auxoncorp/probe-rs.git", branch = "s32k3xx" }
 
 [profile.release]
 strip="debuginfo"
