@@ -180,6 +180,53 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
+    // Start the core if it's halted
+    if target_cfg.reset || !matches!(core_status, CoreStatus::Running) {
+        let sp_reg = core.stack_pointer();
+        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+        let pc_reg = core.program_counter();
+        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+        debug!(pc = %pc, sp = %sp, "Run core");
+        core.run()?;
+    }
+
+    if rtt_cfg.setup_on_breakpoint_address.is_some() {
+        debug!("Waiting for breakpoint");
+        'bp_loop: loop {
+            if interruptor.is_set() {
+                break;
+            }
+
+            let core_status = core.status()?;
+
+            match core_status {
+                CoreStatus::Running => (),
+                CoreStatus::Halted(halt_reason) => match halt_reason {
+                    HaltReason::Breakpoint(_) => {
+                        let sp_reg = core.stack_pointer();
+                        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+                        let pc_reg = core.program_counter();
+                        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+                        debug!(pc = %pc, sp = %sp, "Breakpoint hit");
+                        break 'bp_loop;
+                    }
+                    _ => {
+                        warn!(reason = ?halt_reason, "Unexpected halt reason");
+                        break 'bp_loop;
+                    }
+                },
+                state => {
+                    warn!(state = ?state, "Core is in an unexpected state");
+                    break 'bp_loop;
+                }
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // The core is run below
+    }
+
     let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
         attach_retry_loop(
             &mut core,
@@ -210,52 +257,9 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         "Opened down channel"
     );
 
-    // Start the core if it's halted
-    if target_cfg.reset || !matches!(core_status, CoreStatus::Running) {
-        let sp_reg = core.stack_pointer();
-        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-        let pc_reg = core.program_counter();
-        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-        debug!(pc = %pc, sp = %sp, "Run core");
-        core.run()?;
-    }
-
     // We've done the initial setup, release the lock and switch over to on-demand sessions
     std::mem::drop(core);
     std::mem::drop(session);
-
-    if rtt_cfg.setup_on_breakpoint_address.is_some() {
-        debug!("Waiting for breakpoint");
-        'bp_loop: loop {
-            if interruptor.is_set() {
-                break;
-            }
-
-            let core_status = session_op(&session_mutex, |session| {
-                let mut core = session.core(target_cfg.core as _)?;
-                Ok(core.status()?)
-            })?;
-
-            match core_status {
-                CoreStatus::Running => (),
-                CoreStatus::Halted(halt_reason) => match halt_reason {
-                    HaltReason::Breakpoint(_) => break 'bp_loop,
-                    _ => {
-                        warn!(reason = ?halt_reason, "Unexpected halt reason");
-                        break 'bp_loop;
-                    }
-                },
-                state => {
-                    warn!(state = ?state, "Core is in an unexpected state");
-                    break 'bp_loop;
-                }
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        // The core is run below
-    }
 
     session_op(&session_mutex, |session| {
         let mut core = session.core(target_cfg.core as _)?;
