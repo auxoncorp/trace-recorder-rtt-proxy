@@ -157,6 +157,12 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         debug!("Reset and halt core");
         // This is what probe-rs does
         core.reset_and_halt(Duration::from_millis(100))?;
+
+        let sp_reg = core.stack_pointer();
+        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+        let pc_reg = core.program_counter();
+        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+        debug!(pc = %pc, sp = %sp);
     }
 
     // Disable any previous vector catching (i.e. user just ran probe-rs run or a debugger)
