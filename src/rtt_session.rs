@@ -117,11 +117,6 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
 
     info!(id = %proxy_session_id, "Starting RTT session");
 
-    // Send the client a success response
-    let resp = ProxySessionStatus::session_started(proxy_session_id);
-    let mut se = serde_json::Serializer::new(&mut stream);
-    resp.serialize(&mut se)?;
-
     let buf_size = if rtt_cfg.rtt_read_buffer_size < 64 {
         RttConfig::DEFAULT_RTT_BUFFER_SIZE as usize
     } else {
@@ -278,6 +273,12 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         "Opened down channel"
     );
 
+    // Send the client a success response once we're pretty sure things are
+    // working
+    let resp = ProxySessionStatus::session_started(proxy_session_id);
+    let mut se = serde_json::Serializer::new(&mut stream);
+    resp.serialize(&mut se)?;
+
     // We've done the initial setup, release the lock and switch over to on-demand sessions
     std::mem::drop(core);
     std::mem::drop(session);
@@ -290,9 +291,8 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
                 debug!("Sending stop command");
                 let cmd = TrcCommand::StopTracing.to_wire_bytes();
                 down_channel.write(&mut core, &cmd)?;
+                thread::sleep(Duration::from_millis(10));
             }
-
-            thread::sleep(Duration::from_millis(10));
 
             debug!("Sending start command");
             let cmd = TrcCommand::StartTracing.to_wire_bytes();
