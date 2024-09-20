@@ -224,6 +224,10 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
             thread::sleep(Duration::from_millis(100));
         }
 
+        debug!("Clear breakpoints post-hit");
+        core.disable_vector_catch(VectorCatchCondition::All)?;
+        core.clear_all_hw_breakpoints()?;
+
         // The core is run below
     }
 
