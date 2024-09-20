@@ -27,7 +27,7 @@ struct Opts {
     pub attach_timeout: Option<humantime::Duration>,
 
     /// Use the provided RTT control block address instead of scanning the target memory for it.
-    #[clap(long, name = "control-block-address", value_parser=clap_num::maybe_hex::<u64>,)]
+    #[clap(long, name = "control-block-address", value_parser=clap_num::maybe_hex::<u64>)]
     pub control_block_address: Option<u64>,
 
     /// Select a specific probe instead of opening the first available one.
@@ -81,9 +81,16 @@ struct Opts {
     #[arg(long)]
     pub breakpoint: Option<String>,
 
+    /// Set a breakpoint on the address of the given symbol
+    /// to signal a stopping condition.
+    ///
+    /// Can be an absolute address (decimal or hex) or symbol name.
+    #[arg(long)]
+    pub stop_on_breakpoint: Option<String>,
+
     /// Assume thumb mode when resolving symbols from the ELF file
     /// for breakpoints.
-    #[arg(long, requires = "breakpoint")]
+    #[arg(long)]
     pub thumb: bool,
 
     /// The ELF file containing the RTT symbols
@@ -218,6 +225,31 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let maybe_stop_on_breakpoint_address = if let Some(bp_sym_or_addr) = &opts.stop_on_breakpoint {
+        if let Some(bp_addr) = bp_sym_or_addr.parse::<u64>().ok().or(u64::from_str_radix(
+            bp_sym_or_addr.trim_start_matches("0x"),
+            16,
+        )
+        .ok())
+        {
+            Some(bp_addr)
+        } else {
+            let elf_file = opts
+                .elf_file
+                .as_ref()
+                .ok_or_else(|| "Using a breakpoint symbol name requires an ELF file".to_owned())?;
+            let mut file = File::open(elf_file)?;
+            let bp_addr = get_symbol(&mut file, bp_sym_or_addr).unwrap();
+            if opts.thumb {
+                Some(bp_addr & !1)
+            } else {
+                Some(bp_addr)
+            }
+        }
+    } else {
+        None
+    };
+
     let cfg = ProxySessionConfig {
         version: rtt_proxy::V1,
         probe: ProbeConfig {
@@ -235,6 +267,7 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
         rtt: RttConfig {
             attach_timeout_ms: opts.attach_timeout.map(|t| t.as_millis() as _),
             setup_on_breakpoint_address: maybe_setup_on_breakpoint_address,
+            stop_on_breakpoint_address: maybe_stop_on_breakpoint_address,
             control_block_address: maybe_control_block_address,
             up_channel: opts.up_channel,
             down_channel: opts.down_channel,

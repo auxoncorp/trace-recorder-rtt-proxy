@@ -133,6 +133,12 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     } else {
         Duration::from_millis(rtt_cfg.rtt_idle_poll_interval_ms as _)
     };
+    // Only check core status every 100ms, based on the idle interval
+    let on_stop_breakpoint_limit = if rtt_cfg.rtt_idle_poll_interval_ms == 0 {
+        100_u32
+    } else {
+        std::cmp::max(100 / rtt_cfg.rtt_idle_poll_interval_ms, 1)
+    };
     let mut host_buffer = vec![0_u8; buf_size];
     let mut metrics = Metrics::new(host_buffer.len());
 
@@ -141,7 +147,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
 
     let rtt_scan_region = if let Some(control_block_addr) = rtt_cfg.control_block_address {
         debug!(
-            control_block_addr,
+            control_block_addr = format_args!("0x{:X}", control_block_addr),
             "Using explicit RTT control block address"
         );
         ScanRegion::Exact(control_block_addr)
@@ -169,7 +175,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     core.disable_vector_catch(VectorCatchCondition::All)?;
     core.clear_all_hw_breakpoints()?;
 
-    // Set breakpoint
+    // Set the breakpoint for setup
     if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
         let num_bp = core.available_breakpoint_units()?;
         debug!(
@@ -190,7 +196,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.run()?;
     }
 
-    if rtt_cfg.setup_on_breakpoint_address.is_some() {
+    if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
         debug!("Waiting for breakpoint");
         'bp_loop: loop {
             if interruptor.is_set() {
@@ -224,11 +230,22 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
             thread::sleep(Duration::from_millis(100));
         }
 
-        debug!("Clear breakpoints post-hit");
-        core.disable_vector_catch(VectorCatchCondition::All)?;
-        core.clear_all_hw_breakpoints()?;
+        debug!("Clear breakpoint after setup post-hit");
+        core.clear_hw_breakpoint(bp_addr)?;
 
         // The core is run below
+    }
+
+    // Set the breakpoint for on-stop
+    if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
+        let num_bp = core.available_breakpoint_units()?;
+        debug!(
+            available_breakpoints = num_bp,
+            addr = format_args!("0x{:X}", bp_addr),
+            check_interval = on_stop_breakpoint_limit,
+            "Setting breakpoint for stopping condition"
+        );
+        core.set_hw_breakpoint(bp_addr)?;
     }
 
     let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
@@ -290,6 +307,8 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         Ok(())
     })?;
 
+    let mut zero_counter = 0_u32;
+    let mut halted_on_breakpoint_addr = None;
     while !interruptor.is_set() {
         let rtt_bytes_read = session_op(&session_mutex, |session| {
             let mut core = session.core(target_cfg.core as _)?;
@@ -299,9 +318,54 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         if rtt_bytes_read != 0 {
             trace!(bytes = rtt_bytes_read, "Writing RTT data");
 
+            zero_counter = 0;
+
             if let Err(e) = stream.write_all(&host_buffer[..rtt_bytes_read]) {
                 info!(error = %e, "Client disconnected");
                 break;
+            }
+        } else if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
+            zero_counter = zero_counter.saturating_add(1);
+
+            // No RTT bytes, check core status if we're configured to stop on
+            // a breakpoint
+            if zero_counter >= on_stop_breakpoint_limit {
+                zero_counter = 0;
+
+                let core_status = session_op(&session_mutex, |session| {
+                    let mut core = session.core(target_cfg.core as _)?;
+                    let status = core.status()?;
+                    Ok(status)
+                })?;
+
+                match core_status {
+                    CoreStatus::Running => (),
+                    CoreStatus::Halted(halt_reason) => match halt_reason {
+                        HaltReason::Breakpoint(_) => {
+                            session_op(&session_mutex, |session| {
+                                let mut core = session.core(target_cfg.core as _)?;
+                                let sp_reg = core.stack_pointer();
+                                let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+                                let pc_reg = core.program_counter();
+                                let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+                                debug!(pc = %pc, sp = %sp, "On-stop breakpoint hit");
+                                Ok(())
+                            })?;
+                            halted_on_breakpoint_addr = Some(bp_addr);
+                            break;
+                        }
+                        _ => {
+                            warn!(reason = ?halt_reason, "Unexpected halt reason");
+                            halted_on_breakpoint_addr = Some(bp_addr);
+                            break;
+                        }
+                    },
+                    state => {
+                        warn!(state = ?state, "Core is in an unexpected state");
+                        halted_on_breakpoint_addr = Some(bp_addr);
+                        break;
+                    }
+                }
             }
         }
 
@@ -327,6 +391,22 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
             let mut core = session.core(target_cfg.core as _)?;
             let cmd = TrcCommand::StopTracing.to_wire_bytes();
             Ok(down_channel.write(&mut core, &cmd)?)
+        })?;
+    }
+
+    if let Some(bp_addr) = halted_on_breakpoint_addr {
+        debug!("Resume core after on-stop breakpoint");
+        session_op(&session_mutex, |session| {
+            let mut core = session.core(target_cfg.core as _)?;
+            if let Err(e) = core.clear_hw_breakpoint(bp_addr) {
+                warn!(
+                    addr = format_args!("0x{:X}", bp_addr),
+                    error = %e,
+                    "Failed to clear hardware breakpoint"
+                );
+            }
+            core.run()?;
+            Ok(())
         })?;
     }
 
