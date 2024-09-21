@@ -105,6 +105,9 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
 
     // In recovery mode we disable hardware-level stateful configs
     if recovery_mode {
+        // Disable exclusive probe access
+        probe_cfg.force_exclusive = false;
+
         // If we got here, then attach-under-reset has worked at least once.
         // Don't reset on further probe attaches.
         probe_cfg.attach_under_reset = false;
@@ -136,6 +139,9 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
             warn!(error = %e, "RTT session returned an error");
 
             if target_cfg.auto_recover {
+                // TODO cfg or recovery thread with time handling
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
                 shutdown_channel
                     .send(Operation::RecoverSession(RecoveryState {
                         proxy_session_id,

@@ -6,7 +6,7 @@ use probe_rs::{
     Permissions, Session,
 };
 use rtt_proxy::{
-    ProbeConfig, ProxySessionConfig, ProxySessionId, ProxySessionStatus, TargetConfig,
+    ProbeConfig, ProxySessionConfig, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map, HashMap};
@@ -237,13 +237,12 @@ impl Manager {
             }
         };
 
-        // Check if we already have an RTT session attached to the core
-        if probe_state
-            .proxy_sessions
-            .values()
-            .any(|ps| ps.target_cfg.core == req_cfg.target.core)
-        {
-            // TODO - relax this constraint
+        // Check if we already have an RTT session attached to the core at the
+        // same control block address
+        if probe_state.proxy_sessions.values().any(|ps| {
+            (ps.target_cfg.core == req_cfg.target.core)
+                && (ps.rtt_cfg.control_block_address == req_cfg.rtt.control_block_address)
+        }) {
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
 
@@ -259,7 +258,7 @@ impl Manager {
             ),
             probe_cfg: req_cfg.probe,
             target_cfg: req_cfg.target.clone(),
-            rtt_cfg: req_cfg.rtt,
+            rtt_cfg: req_cfg.rtt.clone(),
             log_rtt_metrics: self.log_rtt_metrics,
             recovery_mode,
             response_already_sent,
@@ -274,6 +273,7 @@ impl Manager {
             proxy_session_id,
             RttSessionState {
                 target_cfg: req_cfg.target,
+                rtt_cfg: req_cfg.rtt,
                 join_handle: Some(join_handle),
             },
         );
@@ -376,6 +376,7 @@ impl ProbeState {
 #[derive(Debug)]
 struct RttSessionState {
     target_cfg: TargetConfig,
+    rtt_cfg: RttConfig,
     join_handle: Option<rtt_session::JoinHandle>,
 }
 
@@ -447,6 +448,6 @@ enum ManagerError {
     #[error("Encountered an error with the debug probe. {0}")]
     DebugProbe(#[from] probe_rs::probe::DebugProbeError),
 
-    #[error("An RTT session is already attached to this target's core")]
+    #[error("An RTT session is already attached to this target's core at the same control block address")]
     RttSessionAlreadyStarted,
 }
