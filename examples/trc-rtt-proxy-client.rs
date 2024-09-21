@@ -99,6 +99,13 @@ struct Opts {
     #[arg(long)]
     pub thumb: bool,
 
+    /// Automatically stop the RTT session if no data is received
+    /// within specified timeout duration.
+    ///
+    /// Accepts durations like "10ms" or "1minute 2seconds 22ms".
+    #[clap(long, name = "no-data-timeout")]
+    pub no_data_timeout: Option<humantime::Duration>,
+
     /// The ELF file containing the RTT symbols
     #[clap(long, name = "elf-file")]
     pub elf_file: Option<PathBuf>,
@@ -275,6 +282,7 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
             attach_timeout_ms: opts.attach_timeout.map(|t| t.as_millis() as _),
             setup_on_breakpoint_address: maybe_setup_on_breakpoint_address,
             stop_on_breakpoint_address: maybe_stop_on_breakpoint_address,
+            no_data_stop_timeout_ms: opts.no_data_timeout.map(|t| t.as_millis() as _),
             control_block_address: maybe_control_block_address,
             up_channel: opts.up_channel,
             down_channel: opts.down_channel,

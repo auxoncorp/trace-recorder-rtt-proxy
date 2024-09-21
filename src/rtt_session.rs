@@ -140,7 +140,7 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
 
             if target_cfg.auto_recover {
                 // TODO cfg or recovery thread with time handling
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(100));
 
                 shutdown_channel
                     .send(Operation::RecoverSession(RecoveryState {
@@ -211,6 +211,10 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     } else {
         std::cmp::max(100 / rtt_cfg.rtt_idle_poll_interval_ms, 1)
     };
+    let no_data_stop_timeout_duration = rtt_cfg
+        .no_data_stop_timeout_ms
+        .map(|ms| Duration::from_millis(std::cmp::max(1, ms as _)));
+
     let mut host_buffer = vec![0_u8; buf_size];
     let mut metrics = Metrics::new(host_buffer.len());
 
@@ -388,6 +392,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         Ok(())
     })?;
 
+    let mut last_nonzero_read = Instant::now();
     let mut zero_counter = 0_u32;
     let mut halted_on_breakpoint_addr = None;
     while !interruptor.is_set() {
@@ -399,52 +404,66 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         if rtt_bytes_read != 0 {
             trace!(bytes = rtt_bytes_read, "Writing RTT data");
 
-            zero_counter = 0;
-
             if let Err(e) = stream.write_all(&host_buffer[..rtt_bytes_read]) {
                 info!(error = %e, "Client disconnected");
                 break;
             }
-        } else if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
-            zero_counter = zero_counter.saturating_add(1);
 
-            // No RTT bytes, check core status if we're configured to stop on
-            // a breakpoint
-            if zero_counter >= on_stop_breakpoint_limit {
-                zero_counter = 0;
+            zero_counter = 0;
+            last_nonzero_read = Instant::now();
+        } else {
+            // No data
 
-                let core_status = session_op(&session_mutex, |session| {
-                    let mut core = session.core(target_cfg.core as _)?;
-                    let status = core.status()?;
-                    Ok(status)
-                })?;
+            // Check for no-data on-stop timeout
+            if let Some(timeout) = no_data_stop_timeout_duration {
+                if Instant::now().duration_since(last_nonzero_read) >= timeout {
+                    debug!(timeout = ?timeout, "Stopping due to no-data timeout");
+                    break;
+                }
+            }
 
-                match core_status {
-                    CoreStatus::Running => (),
-                    CoreStatus::Halted(halt_reason) => match halt_reason {
-                        HaltReason::Breakpoint(_) => {
-                            session_op(&session_mutex, |session| {
-                                let mut core = session.core(target_cfg.core as _)?;
-                                let sp_reg = core.stack_pointer();
-                                let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-                                let pc_reg = core.program_counter();
-                                let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-                                debug!(pc = %pc, sp = %sp, "On-stop breakpoint hit");
-                                Ok(())
-                            })?;
+            // Check for on-stop breakpoint
+            if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
+                zero_counter = zero_counter.saturating_add(1);
+
+                // No RTT bytes, check core status if we're configured to stop on
+                // a breakpoint
+                if zero_counter >= on_stop_breakpoint_limit {
+                    zero_counter = 0;
+
+                    let core_status = session_op(&session_mutex, |session| {
+                        let mut core = session.core(target_cfg.core as _)?;
+                        let status = core.status()?;
+                        Ok(status)
+                    })?;
+
+                    match core_status {
+                        CoreStatus::Running => (),
+                        CoreStatus::Halted(halt_reason) => match halt_reason {
+                            HaltReason::Breakpoint(_) => {
+                                session_op(&session_mutex, |session| {
+                                    let mut core = session.core(target_cfg.core as _)?;
+                                    let sp_reg = core.stack_pointer();
+                                    let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+                                    let pc_reg = core.program_counter();
+                                    let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+                                    debug!(pc = %pc, sp = %sp, "On-stop breakpoint hit");
+                                    Ok(())
+                                })?;
+                                halted_on_breakpoint_addr = Some(bp_addr);
+                                break;
+                            }
+                            _ => {
+                                warn!(reason = ?halt_reason, "Unexpected halt reason");
+                                halted_on_breakpoint_addr = Some(bp_addr);
+                                break;
+                            }
+                        },
+                        state => {
+                            warn!(state = ?state, "Core is in an unexpected state");
                             halted_on_breakpoint_addr = Some(bp_addr);
                             break;
                         }
-                        _ => {
-                            warn!(reason = ?halt_reason, "Unexpected halt reason");
-                            halted_on_breakpoint_addr = Some(bp_addr);
-                            break;
-                        }
-                    },
-                    state => {
-                        warn!(state = ?state, "Core is in an unexpected state");
-                        halted_on_breakpoint_addr = Some(bp_addr);
-                        break;
                     }
                 }
             }

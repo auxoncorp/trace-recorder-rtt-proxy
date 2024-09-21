@@ -81,6 +81,7 @@ pub struct RttConfig {
     pub attach_timeout_ms: Option<u32>,
     pub setup_on_breakpoint_address: Option<u64>,
     pub stop_on_breakpoint_address: Option<u64>,
+    pub no_data_stop_timeout_ms: Option<u32>,
     /// If None, memory will be scanned for the control block
     pub control_block_address: Option<u64>,
     pub up_channel: u32,
@@ -105,6 +106,7 @@ impl Default for RttConfig {
             attach_timeout_ms: None,
             setup_on_breakpoint_address: None,
             stop_on_breakpoint_address: None,
+            no_data_stop_timeout_ms: None,
             control_block_address: None,
             up_channel: 1,
             down_channel: 1,
