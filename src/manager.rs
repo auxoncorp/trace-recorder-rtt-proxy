@@ -246,6 +246,19 @@ impl Manager {
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
 
+        let core_thread_name_suffix = {
+            let num_sessions_on_core = probe_state
+                .proxy_sessions
+                .values()
+                .filter(|ps| ps.target_cfg.core == req_cfg.target.core)
+                .count();
+            if num_sessions_on_core == 0 {
+                format!("{}", req_cfg.target.core)
+            } else {
+                format!("{}.{}", req_cfg.target.core, num_sessions_on_core)
+            }
+        };
+
         let proxy_session_id = Uuid::new_v4();
         let spawn_args = rtt_session::SpawnArgs {
             proxy_session_id,
@@ -254,7 +267,7 @@ impl Manager {
             // https://github.com/tokio-rs/tracing/issues/2465
             thread_name: format!(
                 "{}::{}:{}",
-                probe_id, probe_state.cfg.target, req_cfg.target.core
+                probe_id, probe_state.cfg.target, core_thread_name_suffix
             ),
             probe_cfg: req_cfg.probe,
             target_cfg: req_cfg.target.clone(),
