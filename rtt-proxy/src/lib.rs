@@ -66,6 +66,9 @@ pub struct ProbeConfig {
 /// Target config
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TargetConfig {
+    /// Automatically attempt to recover the debug probe connection
+    /// when an error is encountered.
+    pub auto_recover: bool,
     pub core: u32,
     /// Reset and halt the core before starting the RTT reader session
     pub reset: bool,

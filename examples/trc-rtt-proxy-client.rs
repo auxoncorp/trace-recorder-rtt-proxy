@@ -9,6 +9,7 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, trace};
 use url::Url;
@@ -73,6 +74,11 @@ struct Opts {
     /// Any existing sessions using this probe will be shut down.
     #[clap(long, name = "force-exclusive")]
     pub force_exclusive: bool,
+
+    /// Automatically attempt to recover the debug probe connection
+    /// when an error is encountered
+    #[clap(long, name = "auto-recover")]
+    pub auto_recover: bool,
 
     /// Set a breakpoint on the address of the given symbol when
     /// enabling RTT BlockIfFull channel mode.
@@ -261,6 +267,7 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
             force_exclusive: opts.force_exclusive,
         },
         target: TargetConfig {
+            auto_recover: opts.auto_recover,
             core: opts.core,
             reset: opts.reset,
         },
@@ -282,22 +289,16 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buffer = vec![0_u8; 2 * cfg.rtt.rtt_read_buffer_size as usize];
 
-    info!(remote = %opts.remote, "Connecting to server");
-    let mut sock = TcpStream::connect(remote)?;
-
-    // Send session config
-    info!("Starting a new session");
-    let mut se = serde_json::Serializer::new(&mut sock);
-    cfg.serialize(&mut se)?;
-
-    // Read response
-    let mut de = serde_json::Deserializer::from_reader(&mut sock);
-    let status = ProxySessionStatus::deserialize(&mut de)?;
-
-    match status {
-        ProxySessionStatus::Started(id) => info!(%id, "Session started"),
-        ProxySessionStatus::Error(e) => return Err(e.into()),
-    }
+    let mut sock = match opts.attach_timeout {
+        Some(to) => {
+            info!(remote = %opts.remote, timeout = %to, "Connecting to server");
+            start_session_retry_loop(to.into(), remote, &cfg)?
+        }
+        None => {
+            info!(remote = %opts.remote, "Connecting to server");
+            start_session(remote, &cfg)?
+        }
+    };
 
     loop {
         let bytes_recvd = sock.read(&mut buffer)?;
@@ -313,6 +314,45 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
     file.flush()?;
 
     Ok(())
+}
+
+fn start_session_retry_loop(
+    timeout: Duration,
+    remote: SocketAddr,
+    cfg: &ProxySessionConfig,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while Instant::now().duration_since(start) <= timeout {
+        match start_session(remote, cfg) {
+            Ok(s) => return Ok(s),
+            Err(_) => continue,
+        }
+    }
+    start_session(remote, cfg)
+}
+
+fn start_session(
+    remote: SocketAddr,
+    cfg: &ProxySessionConfig,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let mut sock = TcpStream::connect(remote)?;
+
+    // Send session config
+    debug!("Starting a new session");
+    let mut se = serde_json::Serializer::new(&mut sock);
+    cfg.serialize(&mut se)?;
+
+    // Read response
+    let mut de = serde_json::Deserializer::from_reader(&mut sock);
+    let status = ProxySessionStatus::deserialize(&mut de)?;
+
+    match status {
+        ProxySessionStatus::Started(id) => {
+            info!(%id, "Session started");
+            Ok(sock)
+        }
+        ProxySessionStatus::Error(e) => Err(e.into()),
+    }
 }
 
 fn get_rtt_symbol<T: io::Read + io::Seek>(stream: &mut T) -> Option<u64> {

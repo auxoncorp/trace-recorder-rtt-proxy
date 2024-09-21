@@ -25,6 +25,7 @@ use uuid::Uuid;
 pub enum Operation {
     Shutdown,
     PruneInactiveSessions,
+    RecoverSession(rtt_session::RecoveryState),
     HandleClient((TcpStream, SocketAddr)),
 }
 
@@ -36,6 +37,12 @@ impl Operation {
 pub enum Error {
     #[error("Manager IO error. {0}")]
     Io(#[from] io::Error),
+}
+
+#[derive(Debug)]
+enum SessionReq {
+    New((ProxySessionConfig, TcpStream)),
+    Recovery(rtt_session::RecoveryState),
 }
 
 pub fn spawn(
@@ -70,6 +77,23 @@ fn manager_thread(
                 debug!("Got prune inactive sessions request");
                 mngr.prune_sessions(false);
             }
+            Operation::RecoverSession(recovery_state) => {
+                debug!(id = %recovery_state.proxy_session_id, "Recovering session");
+                mngr.prune_sessions(false);
+                if let Err(e) =
+                    mngr.handle_new_session_req(SessionReq::Recovery(recovery_state.try_clone()?))
+                {
+                    warn!(id = %recovery_state.proxy_session_id, error = %e, "Session recovery failed");
+
+                    // TODO cfg or recovery thread with time handling
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+
+                    // Try again
+                    mngr.op_tx_for_sessions
+                        .send(Operation::RecoverSession(recovery_state))
+                        .ok();
+                }
+            }
             Operation::HandleClient((mut client, client_addr)) => {
                 debug!(peer = %client_addr, "Waiting for config");
                 let config_res = {
@@ -84,7 +108,8 @@ fn manager_thread(
                         trace!(?cfg);
 
                         // The RTT sesssion thread will send the Ok response
-                        if let Err(e) = mngr.handle_new_session_req(cfg, client) {
+                        if let Err(e) = mngr.handle_new_session_req(SessionReq::New((cfg, client)))
+                        {
                             warn!(peer = %client_addr, error = %e, "Dropping client due to error");
                             let resp = ProxySessionStatus::error(e);
                             if resp.serialize(&mut client_resp_stream).is_err() {
@@ -163,15 +188,26 @@ impl Manager {
         });
     }
 
-    fn handle_new_session_req(
-        &mut self,
-        req: ProxySessionConfig,
-        client: TcpStream,
-    ) -> Result<(), ManagerError> {
-        let probe_info = Self::find_probe_info(&req.probe)?;
+    fn handle_new_session_req(&mut self, req: SessionReq) -> Result<(), ManagerError> {
+        let (recovery_mode, response_already_sent, req_cfg, client) = match req {
+            SessionReq::New((cfg, c)) => (false, false, cfg, c),
+            SessionReq::Recovery(recovery_state) => (
+                true,
+                recovery_state.response_already_sent,
+                ProxySessionConfig {
+                    version: rtt_proxy::V1,
+                    probe: recovery_state.probe_cfg,
+                    target: recovery_state.target_cfg,
+                    rtt: recovery_state.rtt_cfg,
+                },
+                recovery_state.stream,
+            ),
+        };
+
+        let probe_info = Self::find_probe_info(&req_cfg.probe)?;
         let probe_id = ProbeId::from(&probe_info);
 
-        if req.probe.force_exclusive {
+        if req_cfg.probe.force_exclusive {
             if let Some(probe_state) = self.probe_states.get_mut(&probe_id) {
                 debug!(probe = %probe_info, "Shutting down sessions for exclusive probe request");
                 probe_state.shutdown_sessions();
@@ -184,16 +220,16 @@ impl Manager {
         let probe_state = match self.probe_states.entry(probe_id.clone()) {
             hash_map::Entry::Occupied(o) => {
                 debug!(probe = %probe_info, "Found existing probe");
-                if o.get().cfg != req.probe {
+                if o.get().cfg != req_cfg.probe {
                     warn!(probe = %probe_info, "Existing configuration does not match requested configuration");
                 }
                 o.into_mut()
             }
             hash_map::Entry::Vacant(v) => {
                 debug!(probe = %probe_info, "Opening probe");
-                let session = Self::setup_probe(&probe_info, &req.probe)?;
+                let session = Self::setup_probe(&probe_info, &req_cfg.probe)?;
                 v.insert(ProbeState {
-                    cfg: req.probe,
+                    cfg: req_cfg.probe.clone(),
                     sessions_interruptor: Interruptor::default(),
                     session: Arc::new(FairMutex::new(session)),
                     proxy_sessions: Default::default(),
@@ -205,8 +241,9 @@ impl Manager {
         if probe_state
             .proxy_sessions
             .values()
-            .any(|ps| ps.target_cfg.core == req.target.core)
+            .any(|ps| ps.target_cfg.core == req_cfg.target.core)
         {
+            // TODO - relax this constraint
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
 
@@ -218,11 +255,14 @@ impl Manager {
             // https://github.com/tokio-rs/tracing/issues/2465
             thread_name: format!(
                 "{}::{}:{}",
-                probe_id, probe_state.cfg.target, req.target.core
+                probe_id, probe_state.cfg.target, req_cfg.target.core
             ),
-            target_cfg: req.target.clone(),
-            rtt_cfg: req.rtt,
+            probe_cfg: req_cfg.probe,
+            target_cfg: req_cfg.target.clone(),
+            rtt_cfg: req_cfg.rtt,
             log_rtt_metrics: self.log_rtt_metrics,
+            recovery_mode,
+            response_already_sent,
             interruptor: probe_state.sessions_interruptor.clone(),
             shutdown_channel: self.op_tx_for_sessions.clone(),
             session: probe_state.session.clone(),
@@ -233,7 +273,7 @@ impl Manager {
         probe_state.proxy_sessions.insert(
             proxy_session_id,
             RttSessionState {
-                target_cfg: req.target,
+                target_cfg: req_cfg.target,
                 join_handle: Some(join_handle),
             },
         );

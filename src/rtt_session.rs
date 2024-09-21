@@ -4,7 +4,7 @@ use probe_rs::{
     rtt::{Rtt, ScanRegion},
     Core, CoreStatus, HaltReason, RegisterValue, Session, VectorCatchCondition,
 };
-use rtt_proxy::{ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig};
+use rtt_proxy::{ProbeConfig, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig};
 use serde::Serialize;
 use simple_moving_average::{NoSumSMA, SMA};
 use std::{
@@ -47,36 +47,86 @@ pub type JoinHandle = thread::JoinHandle<Result<(), Error>>;
 pub struct SpawnArgs {
     pub thread_name: String,
     pub proxy_session_id: ProxySessionId,
+    pub probe_cfg: ProbeConfig,
     pub target_cfg: TargetConfig,
     pub rtt_cfg: RttConfig,
     pub log_rtt_metrics: bool,
+    pub recovery_mode: bool,
+    pub response_already_sent: bool,
     pub interruptor: Interruptor,
     pub shutdown_channel: mpsc::SyncSender<Operation>,
     pub session: Arc<FairMutex<Session>>,
     pub stream: TcpStream,
 }
 
+#[derive(Debug)]
+pub struct RecoveryState {
+    pub proxy_session_id: ProxySessionId,
+    pub probe_cfg: ProbeConfig,
+    pub target_cfg: TargetConfig,
+    pub rtt_cfg: RttConfig,
+    pub response_already_sent: bool,
+    pub stream: TcpStream,
+}
+
+impl RecoveryState {
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            proxy_session_id: self.proxy_session_id,
+            probe_cfg: self.probe_cfg.clone(),
+            target_cfg: self.target_cfg.clone(),
+            rtt_cfg: self.rtt_cfg.clone(),
+            response_already_sent: self.response_already_sent,
+            stream: self.stream.try_clone()?,
+        })
+    }
+}
+
 pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
     let SpawnArgs {
         thread_name,
         proxy_session_id,
-        target_cfg,
-        rtt_cfg,
+        mut probe_cfg,
+        mut target_cfg,
+        mut rtt_cfg,
         log_rtt_metrics,
+        recovery_mode,
+        response_already_sent,
         interruptor,
         shutdown_channel,
         session,
         stream,
     } = args;
 
+    let atomic_response_already_sent = ResponseSentState::new();
+    if response_already_sent {
+        atomic_response_already_sent.set();
+    }
+
+    // In recovery mode we disable hardware-level stateful configs
+    if recovery_mode {
+        // If we got here, then attach-under-reset has worked at least once.
+        // Don't reset on further probe attaches.
+        probe_cfg.attach_under_reset = false;
+
+        // Don't reset the core
+        target_cfg.reset = false;
+
+        // Disable breakpoints, likely will miss them anyhow
+        rtt_cfg.setup_on_breakpoint_address = None;
+        rtt_cfg.stop_on_breakpoint_address = None;
+    }
+
     let cfg = Config {
         proxy_session_id,
-        target_cfg,
-        rtt_cfg,
+        target_cfg: target_cfg.clone(),
+        rtt_cfg: rtt_cfg.clone(),
         log_rtt_metrics,
+        recovery_mode,
+        response_already_sent: atomic_response_already_sent.clone(),
         interruptor,
         session,
-        stream,
+        stream: stream.try_clone()?,
     };
 
     let builder = thread::Builder::new().name(thread_name);
@@ -84,6 +134,20 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
         let res = rtt_session_thread(cfg);
         if let Err(e) = &res {
             warn!(error = %e, "RTT session returned an error");
+
+            if target_cfg.auto_recover {
+                shutdown_channel
+                    .send(Operation::RecoverSession(RecoveryState {
+                        proxy_session_id,
+                        probe_cfg,
+                        target_cfg,
+                        rtt_cfg,
+                        response_already_sent: atomic_response_already_sent.is_set(),
+                        stream,
+                    }))
+                    .ok();
+                return res;
+            }
         }
 
         shutdown_channel.send(Operation::PruneInactiveSessions).ok();
@@ -98,10 +162,15 @@ struct Config {
     target_cfg: TargetConfig,
     rtt_cfg: RttConfig,
     log_rtt_metrics: bool,
+    recovery_mode: bool,
+    response_already_sent: ResponseSentState,
     interruptor: Interruptor,
     session: Arc<FairMutex<Session>>,
     stream: TcpStream,
 }
+
+// Just re-using the atomic bool semantics of Interruptor
+type ResponseSentState = Interruptor;
 
 fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     let Config {
@@ -109,13 +178,15 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         target_cfg,
         rtt_cfg,
         log_rtt_metrics,
+        recovery_mode,
+        response_already_sent,
         interruptor,
         session,
         mut stream,
     } = cfg;
     let session_mutex = session;
 
-    info!(id = %proxy_session_id, "Starting RTT session");
+    info!(id = %proxy_session_id, recovery_mode, "Starting RTT session");
 
     let buf_size = if rtt_cfg.rtt_read_buffer_size < 64 {
         RttConfig::DEFAULT_RTT_BUFFER_SIZE as usize
@@ -274,10 +345,14 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     );
 
     // Send the client a success response once we're pretty sure things are
-    // working
-    let resp = ProxySessionStatus::session_started(proxy_session_id);
-    let mut se = serde_json::Serializer::new(&mut stream);
-    resp.serialize(&mut se)?;
+    // working if we haven't already
+    if !response_already_sent.is_set() {
+        debug!("Sending client response");
+        let resp = ProxySessionStatus::session_started(proxy_session_id);
+        let mut se = serde_json::Serializer::new(&mut stream);
+        resp.serialize(&mut se)?;
+        response_already_sent.set();
+    }
 
     // We've done the initial setup, release the lock and switch over to on-demand sessions
     std::mem::drop(core);
