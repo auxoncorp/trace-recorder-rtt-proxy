@@ -21,6 +21,11 @@ pub enum ProxySessionStatus {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ProxySessionControl {
+    Shutdown(ProxySessionId),
+}
+
 impl ProxySessionStatus {
     pub fn session_started(id: ProxySessionId) -> Self {
         ProxySessionStatus::Started(id)

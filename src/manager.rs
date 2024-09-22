@@ -9,7 +9,7 @@ use rtt_proxy::{
     ProbeConfig, ProxySessionConfig, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map, HashMap};
+use std::collections::{hash_map, HashMap, HashSet};
 use std::{
     fmt, io,
     net::{SocketAddr, TcpStream},
@@ -24,6 +24,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum Operation {
     Shutdown,
+    ShutdownSession(ProxySessionId),
     PruneInactiveSessions,
     RecoverSession(rtt_session::RecoveryState),
     HandleClient((TcpStream, SocketAddr)),
@@ -61,6 +62,8 @@ fn manager_thread(
 ) -> Result<(), Error> {
     info!("Starting manager");
 
+    let mut shutdown_sessions = HashSet::new();
+
     let mut mngr = Manager::new(log_rtt_metrics, op_tx_for_sessions);
 
     loop {
@@ -73,6 +76,12 @@ fn manager_thread(
                 info!("Got shutdown request");
                 break;
             }
+            Operation::ShutdownSession(id) => {
+                info!(%id, "Got shutdown session request");
+                shutdown_sessions.insert(id);
+                mngr.shutdown_session(id);
+                mngr.prune_sessions(false);
+            }
             Operation::PruneInactiveSessions => {
                 debug!("Got prune inactive sessions request");
                 mngr.prune_sessions(false);
@@ -80,13 +89,19 @@ fn manager_thread(
             Operation::RecoverSession(recovery_state) => {
                 debug!(id = %recovery_state.proxy_session_id, "Recovering session");
                 mngr.prune_sessions(false);
+
+                if shutdown_sessions.remove(&recovery_state.proxy_session_id) {
+                    debug!("Ignore recovery due to shutdown");
+                    continue;
+                }
+
                 if let Err(e) =
                     mngr.handle_new_session_req(SessionReq::Recovery(recovery_state.try_clone()?))
                 {
                     warn!(id = %recovery_state.proxy_session_id, error = %e, "Session recovery failed");
 
                     // TODO cfg or recovery thread with time handling
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
 
                     // Try again
                     mngr.op_tx_for_sessions
@@ -151,10 +166,24 @@ impl Manager {
     }
 
     fn shutdown_blocking(&mut self) {
-        for probe_state in self.probe_states.values() {
-            probe_state.sessions_interruptor.set();
+        for session_state in self
+            .probe_states
+            .values()
+            .flat_map(|ps| ps.proxy_sessions.values())
+        {
+            session_state.interruptor.set();
         }
         self.prune_sessions(true);
+    }
+
+    fn shutdown_session(&mut self, id: ProxySessionId) {
+        if let Some(session_state) = self
+            .probe_states
+            .values_mut()
+            .find_map(|ps| ps.proxy_sessions.get_mut(&id))
+        {
+            session_state.interruptor.set();
+        }
     }
 
     fn prune_sessions(&mut self, wait_for_session_shutdown: bool) {
@@ -189,11 +218,12 @@ impl Manager {
     }
 
     fn handle_new_session_req(&mut self, req: SessionReq) -> Result<(), ManagerError> {
-        let (recovery_mode, response_already_sent, req_cfg, client) = match req {
-            SessionReq::New((cfg, c)) => (false, false, cfg, c),
+        let (recovery_mode, response_already_sent, proxy_session_id, req_cfg, client) = match req {
+            SessionReq::New((cfg, c)) => (false, false, Uuid::new_v4(), cfg, c),
             SessionReq::Recovery(recovery_state) => (
                 true,
                 recovery_state.response_already_sent,
+                recovery_state.proxy_session_id,
                 ProxySessionConfig {
                     version: rtt_proxy::V1,
                     probe: recovery_state.probe_cfg,
@@ -230,7 +260,6 @@ impl Manager {
                 let session = Self::setup_probe(&probe_info, &req_cfg.probe)?;
                 v.insert(ProbeState {
                     cfg: req_cfg.probe.clone(),
-                    sessions_interruptor: Interruptor::default(),
                     session: Arc::new(FairMutex::new(session)),
                     proxy_sessions: Default::default(),
                 })
@@ -259,7 +288,7 @@ impl Manager {
             }
         };
 
-        let proxy_session_id = Uuid::new_v4();
+        let session_interruptor = Interruptor::default();
         let spawn_args = rtt_session::SpawnArgs {
             proxy_session_id,
             // NOTE: tracing_subscribe will indent to largest thread name,
@@ -275,7 +304,7 @@ impl Manager {
             log_rtt_metrics: self.log_rtt_metrics,
             recovery_mode,
             response_already_sent,
-            interruptor: probe_state.sessions_interruptor.clone(),
+            interruptor: session_interruptor.clone(),
             shutdown_channel: self.op_tx_for_sessions.clone(),
             session: probe_state.session.clone(),
             stream: client,
@@ -287,6 +316,7 @@ impl Manager {
             RttSessionState {
                 target_cfg: req_cfg.target,
                 rtt_cfg: req_cfg.rtt,
+                interruptor: session_interruptor,
                 join_handle: Some(join_handle),
             },
         );
@@ -365,14 +395,15 @@ impl Manager {
 #[derive(Debug)]
 struct ProbeState {
     cfg: ProbeConfig,
-    sessions_interruptor: Interruptor,
     session: Arc<FairMutex<Session>>,
     proxy_sessions: HashMap<ProxySessionId, RttSessionState>,
 }
 
 impl ProbeState {
     fn shutdown_sessions(&mut self) {
-        self.sessions_interruptor.set();
+        for state in self.proxy_sessions.values() {
+            state.interruptor.set();
+        }
 
         let mut proxy_sessions = HashMap::new();
         std::mem::swap(&mut self.proxy_sessions, &mut proxy_sessions);
@@ -390,6 +421,7 @@ impl ProbeState {
 struct RttSessionState {
     target_cfg: TargetConfig,
     rtt_cfg: RttConfig,
+    interruptor: Interruptor,
     join_handle: Option<rtt_session::JoinHandle>,
 }
 

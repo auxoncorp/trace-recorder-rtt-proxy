@@ -4,7 +4,10 @@ use probe_rs::{
     rtt::{Rtt, ScanRegion},
     Core, CoreStatus, HaltReason, RegisterValue, Session, VectorCatchCondition,
 };
-use rtt_proxy::{ProbeConfig, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig};
+use rtt_proxy::{
+    ProbeConfig, ProxySessionControl, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
+};
+use serde::Deserialize;
 use serde::Serialize;
 use simple_moving_average::{NoSumSMA, SMA};
 use std::{
@@ -118,6 +121,15 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
         // Disable breakpoints, likely will miss them anyhow
         rtt_cfg.setup_on_breakpoint_address = None;
         rtt_cfg.stop_on_breakpoint_address = None;
+    } else {
+        // Not in recovery mode, this is new session
+        let _jh = spawn_control_thread(
+            proxy_session_id,
+            format!("{}:control", thread_name),
+            interruptor.clone(),
+            shutdown_channel.clone(),
+            stream.try_clone()?,
+        )?;
     }
 
     let cfg = Config {
@@ -617,4 +629,37 @@ impl Metrics {
             self.reset();
         }
     }
+}
+
+fn spawn_control_thread(
+    proxy_session_id: ProxySessionId,
+    thread_name: String,
+    interruptor: Interruptor,
+    shutdown_channel: mpsc::SyncSender<Operation>,
+    mut stream: TcpStream,
+) -> io::Result<JoinHandle> {
+    let builder = thread::Builder::new().name(thread_name);
+    builder.spawn(move || {
+        info!(id = %proxy_session_id, "Starting RTT session control");
+
+        let mut de = serde_json::Deserializer::from_reader(&mut stream);
+        match ProxySessionControl::deserialize(&mut de) {
+            Ok(_cmd) => {
+                info!("Shutting down");
+            }
+            Err(e) => {
+                warn!(error = %e, "Shuttind down due to control error");
+            }
+        }
+
+        interruptor.set();
+
+        stream.shutdown(std::net::Shutdown::Both).ok();
+
+        shutdown_channel
+            .send(Operation::ShutdownSession(proxy_session_id))
+            .ok();
+
+        Ok(())
+    })
 }
