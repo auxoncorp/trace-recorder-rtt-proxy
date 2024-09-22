@@ -152,7 +152,7 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
 
             if target_cfg.auto_recover {
                 // TODO cfg or recovery thread with time handling
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(10));
 
                 shutdown_channel
                     .send(Operation::RecoverSession(RecoveryState {
