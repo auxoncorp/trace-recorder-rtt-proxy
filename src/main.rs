@@ -23,7 +23,7 @@ struct Opts {
         long,
         name = "address",
         env = "TRC_RTT_PROXY_ADDRESS",
-        default_value = "0.0.0.0:8888"
+        default_value = "127.0.0.1:8888"
     )]
     pub address: SocketAddr,
 
