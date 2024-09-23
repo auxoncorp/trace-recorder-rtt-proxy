@@ -259,11 +259,11 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         debug!(pc = %pc, sp = %sp);
     }
 
-    // TODO don't do this on shared-core/bootloader-companion targets
-    //
     // Disable any previous vector catching (i.e. user just ran probe-rs run or a debugger)
-    core.disable_vector_catch(VectorCatchCondition::All)?;
-    core.clear_all_hw_breakpoints()?;
+    if !target_cfg.bootloader_companion_application {
+        core.disable_vector_catch(VectorCatchCondition::All)?;
+        core.clear_all_hw_breakpoints()?;
+    }
 
     // Set the breakpoint for setup
     if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
@@ -276,9 +276,10 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
-    // TODO don't do this on shared-core/bootloader-companion targets
     // Start the core if it's halted
-    if target_cfg.reset || !matches!(core_status, CoreStatus::Running) {
+    if !target_cfg.bootloader_companion_application
+        && (target_cfg.reset || !matches!(core_status, CoreStatus::Running))
+    {
         let sp_reg = core.stack_pointer();
         let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
         let pc_reg = core.program_counter();
@@ -346,7 +347,6 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     std::mem::drop(core);
     std::mem::drop(session);
 
-    // TODO this timeout loop needs to release session lock
     let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
         attach_retry_loop(
             &session_mutex,
@@ -553,7 +553,7 @@ fn attach_retry_loop(
             return Err(Error::ShutdownRequestedWhileInitializing);
         }
 
-        let res = session_op(&session_mutex, |session| {
+        let res = session_op(session_mutex, |session| {
             let mut core = session.core(core)?;
             Ok(Rtt::attach_region(&mut core, scan_region)?)
         });
@@ -567,14 +567,14 @@ fn attach_retry_loop(
                 }
 
                 error!(error = %e, "Failed to attach to RTT");
-                return Err(e.into());
+                return Err(e);
             }
         }
     }
 
     // Timeout reached
     warn!("Timed out attaching to RTT");
-    session_op(&session_mutex, |session| {
+    session_op(session_mutex, |session| {
         let mut core = session.core(core)?;
         Ok(Rtt::attach_region(&mut core, scan_region)?)
     })
