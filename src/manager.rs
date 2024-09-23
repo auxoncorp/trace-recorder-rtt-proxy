@@ -101,7 +101,7 @@ fn manager_thread(
                     warn!(id = %recovery_state.proxy_session_id, error = %e, "Session recovery failed");
 
                     // TODO cfg or recovery thread with time handling
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
 
                     // Try again
                     mngr.op_tx_for_sessions
