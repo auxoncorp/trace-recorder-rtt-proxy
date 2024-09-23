@@ -154,6 +154,7 @@ struct Manager {
     log_rtt_metrics: bool,
     probe_states: HashMap<ProbeId, ProbeState>,
     op_tx_for_sessions: mpsc::SyncSender<Operation>,
+    session_thread_names: HashMap<ProxySessionId, String>,
 }
 
 impl Manager {
@@ -162,6 +163,7 @@ impl Manager {
             log_rtt_metrics,
             probe_states: Default::default(),
             op_tx_for_sessions,
+            session_thread_names: Default::default(),
         }
     }
 
@@ -183,6 +185,7 @@ impl Manager {
             .find_map(|ps| ps.proxy_sessions.get_mut(&id))
         {
             session_state.interruptor.set();
+            self.session_thread_names.remove(&id);
         }
     }
 
@@ -275,29 +278,37 @@ impl Manager {
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
 
-        let core_thread_name_suffix = {
-            let num_sessions_on_core = probe_state
-                .proxy_sessions
-                .values()
-                .filter(|ps| ps.target_cfg.core == req_cfg.target.core)
-                .count();
-            if num_sessions_on_core == 0 {
-                format!("{}", req_cfg.target.core)
-            } else {
-                format!("{}.{}", req_cfg.target.core, num_sessions_on_core)
+        // Persist thread names across recovery lifecycles
+        let thread_name = match self.session_thread_names.entry(proxy_session_id) {
+            hash_map::Entry::Occupied(o) => o.get().clone(),
+            hash_map::Entry::Vacant(v) => {
+                let core_thread_name_suffix = {
+                    let num_sessions_on_core = probe_state
+                        .proxy_sessions
+                        .values()
+                        .filter(|ps| ps.target_cfg.core == req_cfg.target.core)
+                        .count();
+                    if num_sessions_on_core == 0 {
+                        format!("{}", req_cfg.target.core)
+                    } else {
+                        format!("{}.{}", req_cfg.target.core, num_sessions_on_core)
+                    }
+                };
+                v.insert(format!(
+                    "{}::{}:{}",
+                    probe_id, probe_state.cfg.target, core_thread_name_suffix
+                ))
+                .clone()
             }
         };
 
         let session_interruptor = Interruptor::default();
         let spawn_args = rtt_session::SpawnArgs {
             proxy_session_id,
-            // NOTE: tracing_subscribe will indent to largest thread name,
+            // NOTE: tracing_subscriber will indent to largest thread name,
             // and you can't turn that off
             // https://github.com/tokio-rs/tracing/issues/2465
-            thread_name: format!(
-                "{}::{}:{}",
-                probe_id, probe_state.cfg.target, core_thread_name_suffix
-            ),
+            thread_name,
             probe_cfg: req_cfg.probe,
             target_cfg: req_cfg.target.clone(),
             rtt_cfg: req_cfg.rtt.clone(),
