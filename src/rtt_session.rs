@@ -147,7 +147,7 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
             warn!(error = %e, "RTT session returned an error");
         }
 
-        let should_recover = (res.is_err() && target_cfg.auto_recover)
+        let should_recover = (res.is_err() && target_cfg.auto_recover && !interruptor.is_set())
             || (res.is_ok()
                 && target_cfg.bootloader
                 && target_cfg.auto_recover
@@ -560,7 +560,7 @@ fn attach_retry_loop(
             Ok(rtt) => return Ok(rtt),
             Err(e) => {
                 if matches!(e, Error::Rtt(probe_rs::rtt::Error::ControlBlockNotFound)) {
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
 
