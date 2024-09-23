@@ -1,2 +1,2 @@
 # Environment File for trace-recorder-rtt-proxy
-RUST_LOG=trc_rtt_proxy=info,probe_rs=error
+RUST_LOG=trc_rtt_proxy=info,probe_rs=error,info
