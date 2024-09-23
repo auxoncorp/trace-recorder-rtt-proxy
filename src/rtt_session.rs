@@ -336,6 +336,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
+    // TODO recovery mode uses the wrong cb address !!!
     let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
         attach_retry_loop(
             &mut core,
@@ -554,7 +555,7 @@ fn attach_retry_loop(
 
     // Timeout reached
     warn!("Timed out attaching to RTT");
-    Ok(Rtt::attach(core)?)
+    Ok(Rtt::attach_region(core, scan_region)?)
 }
 
 fn session_op<F, T>(session_mutex: &Arc<FairMutex<Session>>, mut f: F) -> Result<T, Error>

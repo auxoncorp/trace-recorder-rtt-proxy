@@ -195,7 +195,7 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let maybe_control_block_address = if let Some(user_provided_addr) = opts.control_block_address {
         info!(
-            rtt_addr = user_provided_addr,
+            rtt_addr = format_args!("0x{:X}", user_provided_addr),
             "Using explicit RTT control block address"
         );
         Some(user_provided_addr)
@@ -203,7 +203,10 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
         info!(elf_file = %elf_file.display(), "Reading ELF file");
         let mut file = File::open(elf_file)?;
         if let Some(rtt_addr) = get_rtt_symbol(&mut file) {
-            info!(rtt_addr = rtt_addr, "Found RTT symbol");
+            info!(
+                rtt_addr = format_args!("0x:{:X}", rtt_addr),
+                "Found RTT symbol"
+            );
             Some(rtt_addr)
         } else {
             info!("Could not find RTT symbol in ELF file");
