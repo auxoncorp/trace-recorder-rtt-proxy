@@ -91,7 +91,7 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
         proxy_session_id,
         mut probe_cfg,
         mut target_cfg,
-        mut rtt_cfg,
+        rtt_cfg,
         log_rtt_metrics,
         recovery_mode,
         response_already_sent,
@@ -135,7 +135,7 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
         log_rtt_metrics,
         recovery_mode,
         response_already_sent: atomic_response_already_sent.clone(),
-        interruptor,
+        interruptor: interruptor.clone(),
         session,
         stream: stream.try_clone()?,
     };
@@ -145,26 +145,31 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
         let res = rtt_session_thread(cfg);
         if let Err(e) = &res {
             warn!(error = %e, "RTT session returned an error");
-
-            if target_cfg.auto_recover {
-                // TODO cfg or recovery thread with time handling
-                thread::sleep(Duration::from_millis(10));
-
-                shutdown_channel
-                    .send(Operation::RecoverSession(RecoveryState {
-                        proxy_session_id,
-                        probe_cfg,
-                        target_cfg,
-                        rtt_cfg,
-                        response_already_sent: atomic_response_already_sent.is_set(),
-                        stream,
-                    }))
-                    .ok();
-                return res;
-            }
         }
 
-        shutdown_channel.send(Operation::PruneInactiveSessions).ok();
+        let should_recover = (res.is_err() && target_cfg.auto_recover)
+            || (res.is_ok()
+                && target_cfg.bootloader
+                && target_cfg.auto_recover
+                && !interruptor.is_set());
+
+        if should_recover {
+            // TODO cfg or recovery thread with time handling
+            thread::sleep(Duration::from_millis(10));
+
+            shutdown_channel
+                .send(Operation::RecoverSession(RecoveryState {
+                    proxy_session_id,
+                    probe_cfg,
+                    target_cfg,
+                    rtt_cfg,
+                    response_already_sent: atomic_response_already_sent.is_set(),
+                    stream,
+                }))
+                .ok();
+        } else {
+            shutdown_channel.send(Operation::PruneInactiveSessions).ok();
+        }
 
         res
     })
