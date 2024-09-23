@@ -66,6 +66,19 @@ struct Opts {
     #[clap(long, name = "reset")]
     pub reset: bool,
 
+    /// This session will have exclusive access to the core's
+    /// control functionality (i.e. hardware breakpoints, reset, etc).
+    /// If another session (i.e. the application to be booted by the bootloader)
+    /// is requested on this core, it will be suspended until this session
+    /// signals completion.
+    #[clap(long, name = "bootloader")]
+    pub bootloader: bool,
+
+    /// This session will not drive any of the core's
+    /// control functionality (i.e. hardware breakpoints, reset, etc)
+    #[clap(long, name = "bootloader-companion-application")]
+    pub bootloader_companion_application: bool,
+
     /// Attach to the chip under hard-reset.
     #[clap(long, name = "attach-under-reset")]
     pub attach_under_reset: bool,
@@ -280,6 +293,8 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
             auto_recover: opts.auto_recover,
             core: opts.core,
             reset: opts.reset,
+            bootloader: opts.bootloader,
+            bootloader_companion_application: opts.bootloader_companion_application,
         },
         rtt: RttConfig {
             attach_timeout_ms: opts.attach_timeout.map(|t| t.as_millis() as _),

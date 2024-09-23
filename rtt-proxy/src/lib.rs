@@ -77,16 +77,15 @@ pub struct TargetConfig {
     pub core: u32,
     /// Reset and halt the core before starting the RTT reader session
     pub reset: bool,
-    /*
     /// This session will have exclusive access to the core's
     /// control functionality (i.e. hardware breakpoints, reset, etc).
     /// If another session (i.e. the application to be booted by the bootloader)
     /// is requested on this core, it will be suspended until this session
     /// signals completion.
     pub bootloader: bool,
-    /// TODO
-    pub application: bool,
-    */
+    /// This session will not drive any of the core's
+    /// control functionality (i.e. hardware breakpoints, reset, etc)
+    pub bootloader_companion_application: bool,
 }
 
 /// RTT config

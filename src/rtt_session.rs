@@ -2,7 +2,7 @@ use crate::{interruptor::Interruptor, manager::Operation, trc_command::TrcComman
 use parking_lot::FairMutex;
 use probe_rs::{
     rtt::{Rtt, ScanRegion},
-    Core, CoreStatus, HaltReason, RegisterValue, Session, VectorCatchCondition,
+    CoreStatus, HaltReason, RegisterValue, Session, VectorCatchCondition,
 };
 use rtt_proxy::{
     ProbeConfig, ProxySessionControl, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
@@ -259,6 +259,8 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         debug!(pc = %pc, sp = %sp);
     }
 
+    // TODO don't do this on shared-core/bootloader-companion targets
+    //
     // Disable any previous vector catching (i.e. user just ran probe-rs run or a debugger)
     core.disable_vector_catch(VectorCatchCondition::All)?;
     core.clear_all_hw_breakpoints()?;
@@ -274,6 +276,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
+    // TODO don't do this on shared-core/bootloader-companion targets
     // Start the core if it's halted
     if target_cfg.reset || !matches!(core_status, CoreStatus::Running) {
         let sp_reg = core.stack_pointer();
@@ -284,6 +287,7 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.run()?;
     }
 
+    // TODO release session lock
     if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
         debug!("Waiting for breakpoint");
         'bp_loop: loop {
@@ -336,17 +340,27 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
-    // TODO recovery mode uses the wrong cb address !!!
+    // TODO probably do session_op for everything
+    //
+    // We've done the initial setup, release the lock and switch over to on-demand session access
+    std::mem::drop(core);
+    std::mem::drop(session);
+
+    // TODO this timeout loop needs to release session lock
     let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
         attach_retry_loop(
-            &mut core,
+            &session_mutex,
+            target_cfg.core as _,
             &rtt_scan_region,
             &interruptor,
             Duration::from_millis(to.into()),
         )?
     } else {
         debug!("Attaching to RTT");
-        Rtt::attach_region(&mut core, &rtt_scan_region)?
+        session_op(&session_mutex, |session| {
+            let mut core = session.core(target_cfg.core as _)?;
+            Ok(Rtt::attach_region(&mut core, &rtt_scan_region)?)
+        })?
     };
     debug!(
         addr = format_args!("0x{:X}", rtt.ptr()),
@@ -356,7 +370,10 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
     let up_channel = rtt
         .up_channel(rtt_cfg.up_channel as _)
         .ok_or(Error::UpChannelInvalid(rtt_cfg.up_channel as _))?;
-    let up_channel_mode = up_channel.mode(&mut core)?;
+    let up_channel_mode = session_op(&session_mutex, |session| {
+        let mut core = session.core(target_cfg.core as _)?;
+        Ok(up_channel.mode(&mut core)?)
+    })?;
     debug!(channel = up_channel.number(), mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
     let down_channel = rtt
         .down_channel(rtt_cfg.down_channel as _)
@@ -376,10 +393,6 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         resp.serialize(&mut se)?;
         response_already_sent.set();
     }
-
-    // We've done the initial setup, release the lock and switch over to on-demand sessions
-    std::mem::drop(core);
-    std::mem::drop(session);
 
     session_op(&session_mutex, |session| {
         let mut core = session.core(target_cfg.core as _)?;
@@ -527,7 +540,8 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
 }
 
 fn attach_retry_loop(
-    core: &mut Core,
+    session_mutex: &Arc<FairMutex<Session>>,
+    core: usize,
     scan_region: &ScanRegion,
     interruptor: &Interruptor,
     timeout: Duration,
@@ -539,10 +553,15 @@ fn attach_retry_loop(
             return Err(Error::ShutdownRequestedWhileInitializing);
         }
 
-        match Rtt::attach_region(core, scan_region) {
+        let res = session_op(&session_mutex, |session| {
+            let mut core = session.core(core)?;
+            Ok(Rtt::attach_region(&mut core, scan_region)?)
+        });
+
+        match res {
             Ok(rtt) => return Ok(rtt),
             Err(e) => {
-                if matches!(e, probe_rs::rtt::Error::ControlBlockNotFound) {
+                if matches!(e, Error::Rtt(probe_rs::rtt::Error::ControlBlockNotFound)) {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -555,7 +574,10 @@ fn attach_retry_loop(
 
     // Timeout reached
     warn!("Timed out attaching to RTT");
-    Ok(Rtt::attach_region(core, scan_region)?)
+    session_op(&session_mutex, |session| {
+        let mut core = session.core(core)?;
+        Ok(Rtt::attach_region(&mut core, scan_region)?)
+    })
 }
 
 fn session_op<F, T>(session_mutex: &Arc<FairMutex<Session>>, mut f: F) -> Result<T, Error>
