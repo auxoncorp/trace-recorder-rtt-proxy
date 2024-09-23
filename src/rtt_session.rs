@@ -288,7 +288,6 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.run()?;
     }
 
-    // TODO release session lock
     if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
         debug!("Waiting for breakpoint");
         'bp_loop: loop {
@@ -341,8 +340,6 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
         core.set_hw_breakpoint(bp_addr)?;
     }
 
-    // TODO probably do session_op for everything
-    //
     // We've done the initial setup, release the lock and switch over to on-demand session access
     std::mem::drop(core);
     std::mem::drop(session);
