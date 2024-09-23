@@ -560,7 +560,7 @@ fn attach_retry_loop(
             Ok(rtt) => return Ok(rtt),
             Err(e) => {
                 if matches!(e, Error::Rtt(probe_rs::rtt::Error::ControlBlockNotFound)) {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
 
