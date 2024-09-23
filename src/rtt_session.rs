@@ -117,10 +117,6 @@ pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
 
         // Don't reset the core
         target_cfg.reset = false;
-
-        // Disable breakpoints, likely will miss them anyhow
-        rtt_cfg.setup_on_breakpoint_address = None;
-        rtt_cfg.stop_on_breakpoint_address = None;
     } else {
         // Not in recovery mode, this is new session
         let _jh = spawn_control_thread(

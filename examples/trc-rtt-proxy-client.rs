@@ -71,12 +71,20 @@ struct Opts {
     /// If another session (i.e. the application to be booted by the bootloader)
     /// is requested on this core, it will be suspended until this session
     /// signals completion.
-    #[clap(long, name = "bootloader")]
+    #[clap(
+        long,
+        name = "bootloader",
+        conflicts_with = "bootloader-companion-application"
+    )]
     pub bootloader: bool,
 
     /// This session will not drive any of the core's
     /// control functionality (i.e. hardware breakpoints, reset, etc)
-    #[clap(long, name = "bootloader-companion-application")]
+    #[clap(
+        long,
+        name = "bootloader-companion-application",
+        conflicts_with = "bootloader"
+    )]
     pub bootloader_companion_application: bool,
 
     /// Attach to the chip under hard-reset.
