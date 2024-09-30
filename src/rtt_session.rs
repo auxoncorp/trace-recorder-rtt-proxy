@@ -1,24 +1,24 @@
-use crate::{interruptor::Interruptor, manager::Operation, trc_command::TrcCommand};
-use parking_lot::FairMutex;
+use crate::{
+    manager::Operation, rate_limiter::RateLimiter, shared_state::SharedStateRc,
+    trc_command::TrcCommand,
+};
+use crossbeam_channel::Sender;
 use probe_rs::{
-    rtt::{Rtt, ScanRegion},
-    CoreStatus, HaltReason, RegisterValue, Session, VectorCatchCondition,
+    rtt::{DownChannel, Rtt, ScanRegion, UpChannel},
+    CoreStatus, HaltReason, RegisterValue, VectorCatchCondition,
 };
-use rtt_proxy::{
-    ProbeConfig, ProxySessionControl, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
-};
+use rtt_proxy::{ProxySessionControl, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig};
 use serde::Deserialize;
 use serde::Serialize;
 use simple_moving_average::{NoSumSMA, SMA};
 use std::{
+    fmt,
     io::{self, Write},
     net::TcpStream,
-    sync::mpsc,
-    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, debug_span, error, info, info_span, trace, trace_span, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,363 +40,480 @@ pub enum Error {
     #[error("The RTT up channel ({0}) is invalid")]
     UpChannelInvalid(usize),
 
-    #[error("The RTT session was requested to shutdown while initializing")]
-    ShutdownRequestedWhileInitializing,
-}
+    #[error("The core ({0}) isn't running")]
+    CoreNotRunning(u32),
 
-pub type JoinHandle = thread::JoinHandle<Result<(), Error>>;
+    #[error("Core status check failed. {0}")]
+    CoreStatus(probe_rs::Error),
 
-#[derive(Debug)]
-pub struct SpawnArgs {
-    pub thread_name: String,
-    pub proxy_session_id: ProxySessionId,
-    pub probe_cfg: ProbeConfig,
-    pub target_cfg: TargetConfig,
-    pub rtt_cfg: RttConfig,
-    pub log_rtt_metrics: bool,
-    pub recovery_mode: bool,
-    pub response_already_sent: bool,
-    pub interruptor: Interruptor,
-    pub shutdown_channel: mpsc::SyncSender<Operation>,
-    pub session: Arc<FairMutex<Session>>,
-    pub stream: TcpStream,
+    // This is the mostly likely error when target power is lost
+    // and we need to do debug probe recovery
+    #[error("Failed to attach core. {0}")]
+    CoreAttach(probe_rs::Error),
+
+    #[error("Client disconnected")]
+    ClientDisconnected,
 }
 
 #[derive(Debug)]
-pub struct RecoveryState {
-    pub proxy_session_id: ProxySessionId,
-    pub probe_cfg: ProbeConfig,
-    pub target_cfg: TargetConfig,
-    pub rtt_cfg: RttConfig,
-    pub response_already_sent: bool,
-    pub stream: TcpStream,
-}
-
-impl RecoveryState {
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            proxy_session_id: self.proxy_session_id,
-            probe_cfg: self.probe_cfg.clone(),
-            target_cfg: self.target_cfg.clone(),
-            rtt_cfg: self.rtt_cfg.clone(),
-            response_already_sent: self.response_already_sent,
-            stream: self.stream.try_clone()?,
-        })
-    }
-}
-
-pub fn spawn(args: SpawnArgs) -> io::Result<JoinHandle> {
-    let SpawnArgs {
-        thread_name,
-        proxy_session_id,
-        mut probe_cfg,
-        mut target_cfg,
-        rtt_cfg,
-        log_rtt_metrics,
-        recovery_mode,
-        response_already_sent,
-        interruptor,
-        shutdown_channel,
-        session,
-        stream,
-    } = args;
-
-    let atomic_response_already_sent = ResponseSentState::new();
-    if response_already_sent {
-        atomic_response_already_sent.set();
-    }
-
-    // In recovery mode we disable hardware-level stateful configs
-    if recovery_mode {
-        // Disable exclusive probe access
-        probe_cfg.force_exclusive = false;
-
-        // If we got here, then attach-under-reset has worked at least once.
-        // Don't reset on further probe attaches.
-        probe_cfg.attach_under_reset = false;
-
-        // Don't reset the core
-        target_cfg.reset = false;
-    } else {
-        // Not in recovery mode, this is new session
-        let _jh = spawn_control_thread(
-            proxy_session_id,
-            format!("{}:control", thread_name),
-            interruptor.clone(),
-            shutdown_channel.clone(),
-            stream.try_clone()?,
-        )?;
-    }
-
-    let cfg = Config {
-        proxy_session_id,
-        target_cfg: target_cfg.clone(),
-        rtt_cfg: rtt_cfg.clone(),
-        log_rtt_metrics,
-        recovery_mode,
-        response_already_sent: atomic_response_already_sent.clone(),
-        interruptor: interruptor.clone(),
-        session,
-        stream: stream.try_clone()?,
-    };
-
-    let builder = thread::Builder::new().name(thread_name);
-    builder.spawn(move || {
-        let res = rtt_session_thread(cfg);
-        if let Err(e) = &res {
-            warn!(error = %e, "RTT session returned an error");
-        }
-
-        let should_recover = (res.is_err() && target_cfg.auto_recover && !interruptor.is_set())
-            || (res.is_ok()
-                && target_cfg.bootloader
-                && target_cfg.auto_recover
-                && !interruptor.is_set());
-
-        if should_recover {
-            // TODO cfg or recovery thread with time handling
-            thread::sleep(Duration::from_millis(100));
-
-            shutdown_channel
-                .send(Operation::RecoverSession(RecoveryState {
-                    proxy_session_id,
-                    probe_cfg,
-                    target_cfg,
-                    rtt_cfg,
-                    response_already_sent: atomic_response_already_sent.is_set(),
-                    stream,
-                }))
-                .ok();
-        } else {
-            shutdown_channel.send(Operation::PruneInactiveSessions).ok();
-        }
-
-        res
-    })
+pub enum RttSessionState {
+    /// Need to perform the core setup routine
+    Init,
+    /// Running the RTT attach routine
+    RttAttach(Instant),
+    /// Attached to RTT and actively reading data
+    Run(Box<RttHandles>),
+    /// Stopping conditions were reached, but can be restarted (i.e. after a power cycle or reset)
+    Stopped(StoppedReason),
+    /// Shutdown down and waiting to be culled, will never come back
+    Shutdown,
 }
 
 #[derive(Debug)]
-struct Config {
-    proxy_session_id: ProxySessionId,
+pub struct RttSession {
+    id: ProxySessionId,
+    name: String,
     target_cfg: TargetConfig,
     rtt_cfg: RttConfig,
     log_rtt_metrics: bool,
-    recovery_mode: bool,
-    response_already_sent: ResponseSentState,
-    interruptor: Interruptor,
-    session: Arc<FairMutex<Session>>,
+    client_response_sent: bool,
+    shared_state: SharedStateRc,
     stream: TcpStream,
+    state: RttSessionState,
+    host_buffer: Vec<u8>,
+    metrics: Metrics,
+    rtt_scan_region: ScanRegion,
+    last_rtt_read_had_data: bool,
+    rtt_poll_limiter: RateLimiter,
+    idle_poll_limiter: RateLimiter,
+    recovery_limiter: RateLimiter,
+    attach_retry_limiter: RateLimiter,
+    stopping_condition_limiter: RateLimiter,
 }
 
-// Just re-using the atomic bool semantics of Interruptor
-type ResponseSentState = Interruptor;
+impl RttSession {
+    const STOPPING_CONDITION_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+    const RECOVERY_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+    const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
-    let Config {
-        proxy_session_id,
-        target_cfg,
-        rtt_cfg,
-        log_rtt_metrics,
-        recovery_mode,
-        response_already_sent,
-        interruptor,
-        session,
-        mut stream,
-    } = cfg;
-    let session_mutex = session;
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: ProxySessionId,
+        name: String,
+        target_cfg: TargetConfig,
+        rtt_cfg: RttConfig,
+        log_rtt_metrics: bool,
+        shared_state: SharedStateRc,
+        op_channel: Sender<Operation>,
+        stream: TcpStream,
+        session: &mut probe_rs::Session,
+    ) -> io::Result<Self> {
+        let _jh = spawn_control_thread(
+            id,
+            format!("{}:control", name),
+            op_channel,
+            stream.try_clone()?,
+        )?;
 
-    info!(id = %proxy_session_id, recovery_mode, "Starting RTT session");
+        let _span = debug_span!("RTT session setup", name).entered();
+        debug!(%id);
 
-    let buf_size = if rtt_cfg.rtt_read_buffer_size < 64 {
-        RttConfig::DEFAULT_RTT_BUFFER_SIZE as usize
-    } else {
-        rtt_cfg.rtt_read_buffer_size as usize
-    };
-    let poll_interval = Duration::from_millis(rtt_cfg.rtt_poll_interval_ms as _);
-    let idle_poll_interval = if rtt_cfg.rtt_idle_poll_interval_ms == 0 {
-        Duration::from_millis(1)
-    } else {
-        Duration::from_millis(rtt_cfg.rtt_idle_poll_interval_ms as _)
-    };
-    // Only check core status every 100ms, based on the idle interval
-    let on_stop_breakpoint_limit = if rtt_cfg.rtt_idle_poll_interval_ms == 0 {
-        100_u32
-    } else {
-        std::cmp::max(100 / rtt_cfg.rtt_idle_poll_interval_ms, 1)
-    };
-    let no_data_stop_timeout_duration = rtt_cfg
-        .no_data_stop_timeout_ms
-        .map(|ms| Duration::from_millis(std::cmp::max(1, ms as _)));
+        let buf_size = if rtt_cfg.rtt_read_buffer_size < 64 {
+            RttConfig::DEFAULT_RTT_BUFFER_SIZE as usize
+        } else {
+            rtt_cfg.rtt_read_buffer_size as usize
+        };
 
-    let mut host_buffer = vec![0_u8; buf_size];
-    let mut metrics = Metrics::new(host_buffer.len());
+        let rtt_poll_limiter = RateLimiter::new(Duration::from_millis(std::cmp::max(
+            1,
+            rtt_cfg.rtt_poll_interval_ms,
+        ) as _));
 
-    // Get a lock on the session while we do setup
-    let mut session = session_mutex.lock();
+        let idle_poll_limiter = RateLimiter::new(Duration::from_millis(std::cmp::max(
+            1,
+            rtt_cfg.rtt_idle_poll_interval_ms,
+        ) as _));
 
-    let rtt_scan_region = if let Some(control_block_addr) = rtt_cfg.control_block_address {
-        debug!(
-            control_block_addr = format_args!("0x{:X}", control_block_addr),
-            "Using explicit RTT control block address"
-        );
-        ScanRegion::Exact(control_block_addr)
-    } else {
-        session.target().rtt_scan_regions.clone()
-    };
+        let recovery_limiter = RateLimiter::new(Self::RECOVERY_CHECK_INTERVAL);
 
-    let mut core = session.core(target_cfg.core as _)?;
-    let core_status = core.status()?;
-    debug!(?core_status);
+        let attach_retry_limiter = RateLimiter::new(Self::ATTACH_RETRY_INTERVAL);
 
-    if target_cfg.reset {
-        debug!("Reset and halt core");
-        // This is what probe-rs does
-        core.reset_and_halt(Duration::from_millis(100))?;
+        let stopping_condition_limiter = RateLimiter::new(Self::STOPPING_CONDITION_CHECK_INTERVAL);
 
-        let sp_reg = core.stack_pointer();
-        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-        let pc_reg = core.program_counter();
-        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-        debug!(pc = %pc, sp = %sp);
+        let host_buffer = vec![0_u8; buf_size];
+        let metrics = Metrics::new(host_buffer.len());
+
+        let rtt_scan_region = if let Some(control_block_addr) = rtt_cfg.control_block_address {
+            debug!(
+                control_block_addr = format_args!("0x{:X}", control_block_addr),
+                "Using explicit RTT control block address"
+            );
+            ScanRegion::Exact(control_block_addr)
+        } else {
+            session.target().rtt_scan_regions.clone()
+        };
+
+        Ok(Self {
+            id,
+            name,
+            target_cfg,
+            rtt_cfg,
+            log_rtt_metrics,
+            client_response_sent: false,
+            shared_state,
+            stream,
+            state: RttSessionState::Init,
+            host_buffer,
+            metrics,
+            rtt_scan_region,
+            last_rtt_read_had_data: true,
+            rtt_poll_limiter,
+            idle_poll_limiter,
+            recovery_limiter,
+            attach_retry_limiter,
+            stopping_condition_limiter,
+        })
     }
 
-    // Disable any previous vector catching (i.e. user just ran probe-rs run or a debugger)
-    if !target_cfg.bootloader_companion_application {
-        core.disable_vector_catch(VectorCatchCondition::All)?;
-        core.clear_all_hw_breakpoints()?;
+    pub fn id(&self) -> ProxySessionId {
+        self.id
     }
 
-    // Set the breakpoint for setup
-    if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
-        let num_bp = core.available_breakpoint_units()?;
-        debug!(
-            available_breakpoints = num_bp,
-            addr = format_args!("0x{:X}", bp_addr),
-            "Setting breakpoint to do RTT channel setup"
-        );
-        core.set_hw_breakpoint(bp_addr)?;
+    pub fn target_config(&self) -> &TargetConfig {
+        &self.target_cfg
     }
 
-    // Start the core if it's halted
-    if !target_cfg.bootloader_companion_application
-        && (target_cfg.reset || !matches!(core_status, CoreStatus::Running))
-    {
-        let sp_reg = core.stack_pointer();
-        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-        let pc_reg = core.program_counter();
-        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-        debug!(pc = %pc, sp = %sp, "Run core");
-        core.run()?;
+    pub fn rtt_config(&self) -> &RttConfig {
+        &self.rtt_cfg
     }
 
-    if let Some(bp_addr) = rtt_cfg.setup_on_breakpoint_address {
-        debug!("Waiting for breakpoint");
-        'bp_loop: loop {
-            if interruptor.is_set() {
-                break;
-            }
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self.state, RttSessionState::Shutdown)
+    }
 
-            let core_status = core.status()?;
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, RttSessionState::Run(_))
+    }
 
-            match core_status {
-                CoreStatus::Running => (),
-                CoreStatus::Halted(halt_reason) => match halt_reason {
-                    HaltReason::Breakpoint(_) => {
-                        let sp_reg = core.stack_pointer();
-                        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-                        let pc_reg = core.program_counter();
-                        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-                        debug!(pc = %pc, sp = %sp, "Breakpoint hit");
-                        break 'bp_loop;
+    pub fn is_stopped(&self) -> bool {
+        matches!(self.state, RttSessionState::Stopped(_))
+    }
+
+    pub fn is_stopped_due_to_core_attach(&self) -> bool {
+        matches!(
+            self.state,
+            RttSessionState::Stopped(StoppedReason::Error(Error::CoreAttach(_)))
+        )
+    }
+
+    pub fn shutdown(&mut self, session: &mut probe_rs::Session) {
+        if !matches!(self.state, RttSessionState::Shutdown) {
+            let _span = info_span!("RTT session shutdown", name = self.name).entered();
+
+            // Do normal stop routine
+            self.stop(session, StoppedReason::Shutdown);
+
+            // Drop the client connection
+            self.stream.shutdown(std::net::Shutdown::Both).ok();
+
+            self.transition_state(RttSessionState::Shutdown);
+        }
+    }
+
+    fn stop(&mut self, session: &mut probe_rs::Session, reason: StoppedReason) {
+        if !matches!(
+            self.state,
+            RttSessionState::Stopped(_) | RttSessionState::Shutdown
+        ) {
+            let _ = self.shared_state.dec_clear_vector_catch_and_breakpoints();
+            let disable_vector_catch = self.shared_state.dec_vector_catch_enabled();
+            self.last_rtt_read_had_data = true;
+
+            if let Ok(mut core) = session.core(self.target_cfg.core as _) {
+                // Only disable vector catches if we're the last session to do so
+                if disable_vector_catch {
+                    debug!("Disabling vector catch");
+                    core.disable_vector_catch(VectorCatchCondition::All).ok();
+                }
+
+                // Send the stop command if we can
+                if let RttSessionState::Run(rtt_handles) = &self.state {
+                    if !self.rtt_cfg.disable_control_plane {
+                        debug!("Sending stop command");
+                        let cmd = TrcCommand::StopTracing.to_wire_bytes();
+                        rtt_handles.down_channel.write(&mut core, &cmd).ok();
                     }
-                    _ => {
-                        warn!(reason = ?halt_reason, "Unexpected halt reason");
-                        break 'bp_loop;
+                }
+
+                // Clear breakpoints
+                if let Some(bp_addr) = self.rtt_cfg.stop_on_breakpoint_address {
+                    if let Err(e) = core.clear_hw_breakpoint(bp_addr) {
+                        warn!(
+                            addr = format_args!("0x{:X}", bp_addr),
+                            error = %e,
+                            "Failed to clear hardware breakpoint"
+                        );
                     }
-                },
-                state => {
-                    warn!(state = ?state, "Core is in an unexpected state");
-                    break 'bp_loop;
+                }
+
+                if matches!(
+                    reason,
+                    StoppedReason::Breakpoint(_) | StoppedReason::ResetCatch
+                ) {
+                    debug!("Resume core after stopping condition");
+                    // Run the core if we're halted due to breakpoint or reset
+                    if core.run().is_err() {
+                        warn!("Failed to resume core");
+                    }
                 }
             }
 
-            thread::sleep(Duration::from_millis(100));
+            self.transition_state(RttSessionState::Stopped(reason));
+        }
+    }
+
+    // Manager calls this each scheduled iteration, regardless of state
+    pub fn update(&mut self, session: &mut probe_rs::Session) {
+        // Shutdown state is non-recoverable
+        if self.is_shutdown() {
+            return;
         }
 
-        debug!("Clear breakpoint after setup post-hit");
-        core.clear_hw_breakpoint(bp_addr)?;
+        let _span = match &self.state {
+            RttSessionState::Init => trace_span!("RTT init", name = self.name).entered(),
+            RttSessionState::RttAttach(_) => trace_span!("RTT attach", name = self.name).entered(),
+            RttSessionState::Run(_) => trace_span!("RTT run", name = self.name).entered(),
+            RttSessionState::Shutdown => trace_span!("Shutdown", name = self.name).entered(),
+            RttSessionState::Stopped(_) => trace_span!("Stopped", name = self.name).entered(),
+        };
 
-        // The core is run below
+        // Attempt to recover if we're configured to do so
+        if self.is_stopped() && self.target_cfg.auto_recover {
+            // Rate limit the recovery attemps
+            if self.recovery_limiter.check() {
+                debug!("Attempting to check core status for recovery");
+                match session.core(self.target_cfg.core as _) {
+                    Ok(mut core) => {
+                        if let Ok(core_status) = core.status() {
+                            debug!(core = self.target_cfg.core, ?core_status, "Core recovery");
+                            self.transition_state(RttSessionState::Init);
+                        }
+                    }
+                    Err(e) => {
+                        // We're already in the stopped state, update the error reason
+                        self.state =
+                            RttSessionState::Stopped(StoppedReason::Error(Error::CoreAttach(e)));
+                    }
+                }
+            }
+
+            // We'll try again on the next cycle
+        } else {
+            // Update state
+            if let Err(e) = self.update_inner(session) {
+                warn!(error = %e);
+                if self.target_cfg.auto_recover && !matches!(e, Error::ClientDisconnected) {
+                    self.stop(session, StoppedReason::Error(e));
+                } else {
+                    self.shutdown(session);
+                }
+            }
+        }
     }
 
-    // Set the breakpoint for on-stop
-    if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
-        let num_bp = core.available_breakpoint_units()?;
+    fn transition_state(&mut self, new_state: RttSessionState) {
         debug!(
-            available_breakpoints = num_bp,
-            addr = format_args!("0x{:X}", bp_addr),
-            check_interval = on_stop_breakpoint_limit,
-            "Setting breakpoint for stopping condition"
+            prev_state = %self.state,
+            state = %new_state,
+            "Transition state"
         );
-        core.set_hw_breakpoint(bp_addr)?;
+        self.state = new_state;
     }
 
-    // We've done the initial setup, release the lock and switch over to on-demand session access
-    std::mem::drop(core);
-    std::mem::drop(session);
+    fn update_inner(&mut self, session: &mut probe_rs::Session) -> Result<(), Error> {
+        let mut state = RttSessionState::Init;
+        std::mem::swap(&mut state, &mut self.state);
+        match state {
+            RttSessionState::Init => {
+                self.do_init(session)?;
+                self.attach_retry_limiter.reset();
+                self.transition_state(RttSessionState::RttAttach(Instant::now()));
+            }
+            RttSessionState::RttAttach(started_at) => {
+                self.state = RttSessionState::RttAttach(started_at);
 
-    let rtt = if let Some(to) = rtt_cfg.attach_timeout_ms {
-        attach_retry_loop(
-            &session_mutex,
-            target_cfg.core as _,
-            &rtt_scan_region,
-            &interruptor,
-            Duration::from_millis(to.into()),
-        )?
-    } else {
-        debug!("Attaching to RTT");
-        session_op(&session_mutex, |session| {
-            let mut core = session.core(target_cfg.core as _)?;
-            Ok(Rtt::attach_region(&mut core, &rtt_scan_region)?)
-        })?
-    };
-    debug!(
-        addr = format_args!("0x{:X}", rtt.ptr()),
-        "Found RTT control block"
-    );
+                if !self.attach_retry_limiter.check() {
+                    return Ok(());
+                }
 
-    let up_channel = rtt
-        .up_channel(rtt_cfg.up_channel as _)
-        .ok_or(Error::UpChannelInvalid(rtt_cfg.up_channel as _))?;
-    let up_channel_mode = session_op(&session_mutex, |session| {
-        let mut core = session.core(target_cfg.core as _)?;
-        Ok(up_channel.mode(&mut core)?)
-    })?;
-    debug!(channel = up_channel.number(), mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
-    let down_channel = rtt
-        .down_channel(rtt_cfg.down_channel as _)
-        .ok_or(Error::DownChannelInvalid(rtt_cfg.down_channel as _))?;
-    debug!(
-        channel = down_channel.number(),
-        buffer_size = down_channel.buffer_size(),
-        "Opened down channel"
-    );
+                let rtt = match self.do_rtt_attach(session) {
+                    Ok(rtt) => rtt,
+                    Err(e) => {
+                        if let Some(ms) = self.rtt_cfg.attach_timeout_ms {
+                            if matches!(e, Error::Rtt(probe_rs::rtt::Error::ControlBlockNotFound)) {
+                                let timeout = Duration::from_millis(ms as _);
+                                if Instant::now().duration_since(started_at) > timeout {
+                                    return Err(e);
+                                } else {
+                                    // We'll try again on the next schedule
+                                    return Ok(());
+                                }
+                            }
+                        }
 
-    // Send the client a success response once we're pretty sure things are
-    // working if we haven't already
-    if !response_already_sent.is_set() {
-        debug!("Sending client response");
-        let resp = ProxySessionStatus::session_started(proxy_session_id);
-        let mut se = serde_json::Serializer::new(&mut stream);
-        resp.serialize(&mut se)?;
-        response_already_sent.set();
+                        return Err(e);
+                    }
+                };
+
+                // Send the client a success response once we're pretty sure things are
+                // working if we haven't already
+                if !self.client_response_sent {
+                    debug!("Sending client response");
+                    let resp = ProxySessionStatus::session_started(self.id);
+                    let mut se = serde_json::Serializer::new(&mut self.stream);
+                    resp.serialize(&mut se)?;
+                    self.client_response_sent = true;
+                }
+
+                self.rtt_poll_limiter.reset();
+                self.idle_poll_limiter.reset();
+                self.recovery_limiter.reset();
+                self.stopping_condition_limiter.reset();
+
+                self.transition_state(RttSessionState::Run(Box::new(rtt)));
+            }
+            RttSessionState::Run(rtt_handles) => {
+                let res = self.do_run(session, &rtt_handles);
+                self.state = RttSessionState::Run(rtt_handles);
+                match res? {
+                    StoppingConditionStatus::NotReached => (),
+                    StoppingConditionStatus::Breakpoint(addr) => {
+                        let reason = StoppedReason::Breakpoint(addr);
+                        debug!(%reason, "Stopping condition reached");
+                        self.stop(session, reason);
+                    }
+                    StoppingConditionStatus::ResetCatch => {
+                        let reason = StoppedReason::ResetCatch;
+                        debug!(%reason, "Stopping condition reached");
+                        self.stop(session, reason);
+                    }
+                }
+            }
+            RttSessionState::Shutdown => {
+                // Do nothing
+                self.state = RttSessionState::Shutdown;
+            }
+            RttSessionState::Stopped(r) => {
+                // Do nothing
+                self.state = RttSessionState::Stopped(r)
+            }
+        }
+        Ok(())
     }
 
-    session_op(&session_mutex, |session| {
-        let mut core = session.core(target_cfg.core as _)?;
+    fn do_init(&mut self, session: &mut probe_rs::Session) -> Result<(), Error> {
+        let mut core = session
+            .core(self.target_cfg.core as _)
+            .map_err(Error::CoreAttach)?;
+        let core_status = core.status().map_err(Error::CoreStatus)?;
+        debug!(core = self.target_cfg.core, ?core_status);
 
-        if !rtt_cfg.disable_control_plane {
-            if rtt_cfg.restart {
+        if self.target_cfg.reset {
+            debug!("Reset and halt core");
+            // This is what probe-rs does
+            core.reset_and_halt(Duration::from_millis(100))?;
+
+            let sp_reg = core.stack_pointer();
+            let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+            let pc_reg = core.program_counter();
+            let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+            debug!(pc = %pc, sp = %sp);
+        }
+
+        // Disable any previous vector catching and breakpoints
+        // if we're the first core to do so (possible this is a shared core session)
+        if self.shared_state.inc_clear_vector_catch_and_breakpoints() {
+            debug!("Clearing previous vector catches and breakpoints");
+            core.disable_vector_catch(VectorCatchCondition::All)?;
+            core.clear_all_hw_breakpoints()?;
+        }
+
+        // If we're the bootloader or companion app core, enable reset vector catching
+        // early on, other cores will do the same after RTT attach succeeds
+        // since they would otherwise trip the catch immediately if they're
+        // waiting to be started by primary core
+        if self.target_cfg.bootloader || self.target_cfg.bootloader_companion_application {
+            // First session on the core will enable it
+            if self.shared_state.inc_vector_catch_enabled() {
+                debug!("Enabling CoreReset vector catch");
+                core.enable_vector_catch(VectorCatchCondition::CoreReset)?;
+            }
+        }
+
+        // Start the core if it's halted, auxilary cores are expected to not be halted
+        if !self.target_cfg.bootloader_companion_application
+            && (self.target_cfg.reset || matches!(core_status, CoreStatus::Halted(_)))
+        {
+            let sp_reg = core.stack_pointer();
+            let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+            let pc_reg = core.program_counter();
+            let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+            debug!(pc = %pc, sp = %sp, "Run core");
+            core.run()?;
+        }
+
+        // Core needs to be running to continue
+        let core_status = core.status().map_err(Error::CoreStatus)?;
+        if !matches!(core_status, CoreStatus::Running) {
+            return Err(Error::CoreNotRunning(self.target_cfg.core));
+        }
+
+        // Set the breakpoint for on-stop
+        if let Some(bp_addr) = self.rtt_cfg.stop_on_breakpoint_address {
+            let num_bp = core.available_breakpoint_units()?;
+            debug!(
+                available_breakpoints = num_bp,
+                addr = format_args!("0x{:X}", bp_addr),
+                "Setting breakpoint for stopping condition"
+            );
+            core.set_hw_breakpoint(bp_addr)?;
+        }
+
+        Ok(())
+    }
+
+    fn do_rtt_attach(&mut self, session: &mut probe_rs::Session) -> Result<RttHandles, Error> {
+        let mut core = session
+            .core(self.target_cfg.core as _)
+            .map_err(Error::CoreAttach)?;
+
+        debug!("Attaching RTT region");
+        let mut rtt = Rtt::attach_region(&mut core, &self.rtt_scan_region)?;
+        debug!(
+            addr = format_args!("0x{:X}", rtt.ptr()),
+            "Found RTT control block"
+        );
+
+        if self.rtt_cfg.up_channel as usize > rtt.up_channels.len() {
+            return Err(Error::UpChannelInvalid(self.rtt_cfg.up_channel as _));
+        }
+        if self.rtt_cfg.down_channel as usize > rtt.down_channels.len() {
+            return Err(Error::DownChannelInvalid(self.rtt_cfg.down_channel as _));
+        }
+
+        let up_channel = rtt.up_channels.remove(self.rtt_cfg.up_channel as _);
+        let up_channel_mode = up_channel.mode(&mut core)?;
+        debug!(channel = up_channel.number(), mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
+
+        let down_channel = rtt.down_channels.remove(self.rtt_cfg.down_channel as _);
+        debug!(
+            channel = down_channel.number(),
+            buffer_size = down_channel.buffer_size(),
+            "Opened down channel"
+        );
+
+        if !self.rtt_cfg.disable_control_plane {
+            if self.rtt_cfg.restart {
                 debug!("Sending stop command");
                 let cmd = TrcCommand::StopTracing.to_wire_bytes();
                 down_channel.write(&mut core, &cmd)?;
@@ -408,185 +525,133 @@ fn rtt_session_thread(cfg: Config) -> Result<(), Error> {
             down_channel.write(&mut core, &cmd)?;
         }
 
-        // Run the core if we hit the breakpoint
-        if rtt_cfg.setup_on_breakpoint_address.is_some() {
-            debug!("Run core post breakpoint");
-            core.run()?;
+        // Auxilary cores get vector catching enabled after we know they're running
+        if !self.target_cfg.bootloader && !self.target_cfg.bootloader_companion_application {
+            // First session on the core will enable it
+            if self.shared_state.inc_vector_catch_enabled() {
+                debug!("Enabling CoreReset vector catch");
+                core.enable_vector_catch(VectorCatchCondition::CoreReset)?;
+            }
         }
-        Ok(())
-    })?;
 
-    let mut last_nonzero_read = Instant::now();
-    let mut zero_counter = 0_u32;
-    let mut halted_on_breakpoint_addr = None;
-    while !interruptor.is_set() {
-        let rtt_bytes_read = session_op(&session_mutex, |session| {
-            let mut core = session.core(target_cfg.core as _)?;
-            Ok(up_channel.read(&mut core, &mut host_buffer)?)
-        })?;
+        Ok(RttHandles {
+            rtt,
+            up_channel,
+            down_channel,
+        })
+    }
+
+    fn do_run(
+        &mut self,
+        session: &mut probe_rs::Session,
+        handles: &RttHandles,
+    ) -> Result<StoppingConditionStatus, Error> {
+        let mut core = session
+            .core(self.target_cfg.core as _)
+            .map_err(Error::CoreAttach)?;
+
+        let rate_limiter = match self.last_rtt_read_had_data {
+            true => &mut self.rtt_poll_limiter,
+            false => &mut self.idle_poll_limiter,
+        };
+
+        let rtt_bytes_read = if rate_limiter.check() {
+            let bytes_read = handles.up_channel.read(&mut core, &mut self.host_buffer)?;
+
+            if self.log_rtt_metrics {
+                self.metrics.update(bytes_read);
+            }
+
+            self.last_rtt_read_had_data = bytes_read != 0;
+
+            bytes_read
+        } else {
+            0
+        };
 
         if rtt_bytes_read != 0 {
             trace!(bytes = rtt_bytes_read, "Writing RTT data");
 
-            if let Err(e) = stream.write_all(&host_buffer[..rtt_bytes_read]) {
+            if let Err(e) = self.stream.write_all(&self.host_buffer[..rtt_bytes_read]) {
                 info!(error = %e, "Client disconnected");
-                break;
+                return Err(Error::ClientDisconnected);
             }
-
-            zero_counter = 0;
-            last_nonzero_read = Instant::now();
         } else {
             // No data
 
-            // Check for no-data on-stop timeout
-            if let Some(timeout) = no_data_stop_timeout_duration {
-                if Instant::now().duration_since(last_nonzero_read) >= timeout {
-                    debug!(timeout = ?timeout, "Stopping due to no-data timeout");
-                    break;
-                }
-            }
-
-            // Check for on-stop breakpoint
-            if let Some(bp_addr) = rtt_cfg.stop_on_breakpoint_address {
-                zero_counter = zero_counter.saturating_add(1);
-
-                // No RTT bytes, check core status if we're configured to stop on
-                // a breakpoint
-                if zero_counter >= on_stop_breakpoint_limit {
-                    zero_counter = 0;
-
-                    let core_status = session_op(&session_mutex, |session| {
-                        let mut core = session.core(target_cfg.core as _)?;
-                        let status = core.status()?;
-                        Ok(status)
-                    })?;
-
-                    match core_status {
-                        CoreStatus::Running => (),
-                        CoreStatus::Halted(halt_reason) => match halt_reason {
+            // Check for stopping conditions (breakpoint, vector catch)
+            if self.stopping_condition_limiter.check() {
+                let core_status = core.status().map_err(Error::CoreStatus)?;
+                match core_status {
+                    CoreStatus::Running => (),
+                    CoreStatus::Halted(halt_reason) => {
+                        let sp_reg = core.stack_pointer();
+                        let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
+                        let pc_reg = core.program_counter();
+                        let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
+                        let pc_addr: u64 = match pc {
+                            RegisterValue::U32(v) => v.into(),
+                            RegisterValue::U64(v) => v,
+                            RegisterValue::U128(v) => v as _,
+                        };
+                        debug!(core = self.target_cfg.core, pc = %pc, sp = %sp, "Core is halted");
+                        match halt_reason {
                             HaltReason::Breakpoint(_) => {
-                                session_op(&session_mutex, |session| {
-                                    let mut core = session.core(target_cfg.core as _)?;
-                                    let sp_reg = core.stack_pointer();
-                                    let sp: RegisterValue = core.read_core_reg(sp_reg.id())?;
-                                    let pc_reg = core.program_counter();
-                                    let pc: RegisterValue = core.read_core_reg(pc_reg.id())?;
-                                    debug!(pc = %pc, sp = %sp, "On-stop breakpoint hit");
-                                    Ok(())
-                                })?;
-                                halted_on_breakpoint_addr = Some(bp_addr);
-                                break;
+                                if let Some(on_stop_addr) = self.rtt_cfg.stop_on_breakpoint_address
+                                {
+                                    if on_stop_addr != pc_addr {
+                                        warn!(bp_addr = on_stop_addr, pc = %pc, "Program counter doesn't match configured breakpoint");
+                                    }
+                                }
+                                return Ok(StoppingConditionStatus::Breakpoint(pc_addr));
+                            }
+                            HaltReason::Exception => {
+                                // We only enable CoreReset vector catch, so this is a reset
+                                return Ok(StoppingConditionStatus::ResetCatch);
                             }
                             _ => {
                                 warn!(reason = ?halt_reason, "Unexpected halt reason");
-                                halted_on_breakpoint_addr = Some(bp_addr);
-                                break;
+                                return Ok(StoppingConditionStatus::ResetCatch);
                             }
-                        },
-                        state => {
-                            warn!(state = ?state, "Core is in an unexpected state");
-                            halted_on_breakpoint_addr = Some(bp_addr);
-                            break;
                         }
+                    }
+                    state => {
+                        warn!(state = ?state, "Core is in an unexpected state");
+                        return Ok(StoppingConditionStatus::ResetCatch);
                     }
                 }
             }
         }
 
-        // This is more-or-less what probe-rs does.
-        // If the polling frequency is too high, the USB connection to the probe
-        // can become unstable.
-        if rtt_bytes_read != 0 {
-            thread::sleep(poll_interval);
-        } else {
-            thread::sleep(idle_poll_interval);
-        }
-
-        if log_rtt_metrics {
-            metrics.update(rtt_bytes_read);
-        }
+        Ok(StoppingConditionStatus::NotReached)
     }
-
-    info!("Shutting down");
-
-    if !rtt_cfg.disable_control_plane {
-        debug!("Sending stop command");
-        session_op(&session_mutex, |session| {
-            let mut core = session.core(target_cfg.core as _)?;
-            let cmd = TrcCommand::StopTracing.to_wire_bytes();
-            Ok(down_channel.write(&mut core, &cmd)?)
-        })?;
-    }
-
-    if let Some(bp_addr) = halted_on_breakpoint_addr {
-        debug!("Resume core after on-stop breakpoint");
-        session_op(&session_mutex, |session| {
-            let mut core = session.core(target_cfg.core as _)?;
-            if let Err(e) = core.clear_hw_breakpoint(bp_addr) {
-                warn!(
-                    addr = format_args!("0x{:X}", bp_addr),
-                    error = %e,
-                    "Failed to clear hardware breakpoint"
-                );
-            }
-            core.run()?;
-            Ok(())
-        })?;
-    }
-
-    Ok(())
 }
 
-fn attach_retry_loop(
-    session_mutex: &Arc<FairMutex<Session>>,
-    core: usize,
-    scan_region: &ScanRegion,
-    interruptor: &Interruptor,
-    timeout: Duration,
-) -> Result<Rtt, Error> {
-    debug!(?timeout, "Attaching to RTT");
-    let start = Instant::now();
-    while Instant::now().duration_since(start) <= timeout {
-        if interruptor.is_set() {
-            return Err(Error::ShutdownRequestedWhileInitializing);
-        }
-
-        let res = session_op(session_mutex, |session| {
-            let mut core = session.core(core)?;
-            Ok(Rtt::attach_region(&mut core, scan_region)?)
-        });
-
-        match res {
-            Ok(rtt) => return Ok(rtt),
-            Err(e) => {
-                if matches!(e, Error::Rtt(probe_rs::rtt::Error::ControlBlockNotFound)) {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-
-                error!(error = %e, "Failed to attach to RTT");
-                return Err(e);
-            }
-        }
-    }
-
-    // Timeout reached
-    warn!("Timed out attaching to RTT");
-    session_op(session_mutex, |session| {
-        let mut core = session.core(core)?;
-        Ok(Rtt::attach_region(&mut core, scan_region)?)
-    })
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+enum StoppingConditionStatus {
+    NotReached,
+    Breakpoint(u64),
+    ResetCatch,
 }
 
-fn session_op<F, T>(session_mutex: &Arc<FairMutex<Session>>, mut f: F) -> Result<T, Error>
-where
-    F: FnMut(&mut Session) -> Result<T, Error>,
-{
-    use std::ops::DerefMut;
-    let mut session = session_mutex.lock();
-    f(session.deref_mut())
+#[derive(Debug)]
+pub enum StoppedReason {
+    Shutdown,
+    Error(Error),
+    ResetCatch,
+    Breakpoint(u64),
 }
 
+#[derive(Debug)]
+pub struct RttHandles {
+    rtt: Rtt,
+    /// RTT up (target to host) channel
+    up_channel: UpChannel,
+    /// RTT down (host to target) channel
+    down_channel: DownChannel,
+}
+
+#[derive(Debug)]
 struct Metrics {
     rtt_buffer_size: u64,
     window_start: Instant,
@@ -652,11 +717,11 @@ impl Metrics {
     }
 }
 
+type JoinHandle = thread::JoinHandle<()>;
 fn spawn_control_thread(
     proxy_session_id: ProxySessionId,
     thread_name: String,
-    interruptor: Interruptor,
-    shutdown_channel: mpsc::SyncSender<Operation>,
+    op_channel: Sender<Operation>,
     mut stream: TcpStream,
 ) -> io::Result<JoinHandle> {
     let builder = thread::Builder::new().name(thread_name);
@@ -669,18 +734,37 @@ fn spawn_control_thread(
                 info!("Shutting down");
             }
             Err(e) => {
-                warn!(error = %e, "Shuttind down due to control error");
+                warn!(error = %e, "Shutting down");
             }
         }
 
-        interruptor.set();
-
         stream.shutdown(std::net::Shutdown::Both).ok();
 
-        shutdown_channel
+        op_channel
             .send(Operation::ShutdownSession(proxy_session_id))
             .ok();
-
-        Ok(())
     })
+}
+
+impl fmt::Display for StoppedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoppedReason::Shutdown => f.write_str("shutdown"),
+            StoppedReason::Error(_) => f.write_str("error"),
+            StoppedReason::Breakpoint(addr) => write!(f, "breakpoint=0x{:X}", addr),
+            StoppedReason::ResetCatch => f.write_str("reset"),
+        }
+    }
+}
+
+impl fmt::Display for RttSessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RttSessionState::Init => f.write_str("INIT"),
+            RttSessionState::RttAttach(_) => f.write_str("RTT_ATTACH"),
+            RttSessionState::Run(rtt) => write!(f, "RUN(cb = 0x{:X})", rtt.rtt.ptr()),
+            RttSessionState::Shutdown => f.write_str("SHUTDOWN"),
+            RttSessionState::Stopped(reason) => write!(f, "STOPPED({})", reason),
+        }
+    }
 }

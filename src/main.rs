@@ -1,16 +1,15 @@
 use crate::interruptor::Interruptor;
 use clap::Parser;
 use probe_rs::probe::list::Lister;
-use std::{
-    net::{SocketAddr, TcpListener},
-    sync::mpsc,
-};
+use std::net::{SocketAddr, TcpListener};
 use tracing::{debug, error, info};
 
 mod interruptor;
 mod manager;
+mod rate_limiter;
 mod rtt_session;
 mod server;
+mod shared_state;
 mod trc_command;
 
 /// Proxy debug-probe operations and RTT data over the network
@@ -57,11 +56,12 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_thread_ids(false)
         .with_thread_names(true)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ENTER)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .compact()
         .init();
 
-    let (op_tx, op_rx) = mpsc::sync_channel(manager::Operation::OPERATION_CHANNEL_SIZE);
+    let (op_tx, op_rx) = crossbeam_channel::bounded(manager::Operation::OPERATION_CHANNEL_SIZE);
 
     let intr = Interruptor::new();
     let handler_op_tx = op_tx.clone();
@@ -108,6 +108,8 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for the manager thread to finish
     manager_handle.join().ok();
+
+    info!("Shutdown complete");
 
     Ok(())
 }

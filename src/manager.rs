@@ -1,38 +1,26 @@
-use crate::{interruptor::Interruptor, rtt_session};
-use parking_lot::FairMutex;
+use crate::{
+    rate_limiter::RateLimiter,
+    rtt_session::RttSession,
+    shared_state::{SharedState, SharedStateRc},
+};
+use crossbeam_channel::{select_biased, tick, Receiver, Sender};
 use probe_rs::{
     config::TargetSelector,
     probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, WireProtocol},
-    Permissions, Session,
+    Permissions,
 };
-use rtt_proxy::{
-    ProbeConfig, ProxySessionConfig, ProxySessionId, ProxySessionStatus, RttConfig, TargetConfig,
-};
+use rtt_proxy::{ProbeConfig, ProxySessionConfig, ProxySessionId, ProxySessionStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map, HashMap, HashSet};
+use std::collections::{hash_map, HashMap};
 use std::{
     fmt, io,
     net::{SocketAddr, TcpStream},
     str::FromStr,
-    sync::mpsc,
-    sync::Arc,
     thread,
+    time::Duration,
 };
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
-
-#[derive(Debug)]
-pub enum Operation {
-    Shutdown,
-    ShutdownSession(ProxySessionId),
-    PruneInactiveSessions,
-    RecoverSession(rtt_session::RecoveryState),
-    HandleClient((TcpStream, SocketAddr)),
-}
-
-impl Operation {
-    pub const OPERATION_CHANNEL_SIZE: usize = 32;
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -41,15 +29,28 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-enum SessionReq {
-    New((ProxySessionConfig, TcpStream)),
-    Recovery(rtt_session::RecoveryState),
+pub enum Operation {
+    Shutdown,
+    ShutdownSession(ProxySessionId),
+    HandleClient((TcpStream, SocketAddr)),
 }
+
+impl Operation {
+    pub const OPERATION_CHANNEL_SIZE: usize = 8;
+}
+
+// This is the value probe-rs uses
+const TARGET_VOLTAGE_POWER_ON_THRESHOLD: f32 = 1.4;
+
+/// Put an upper bound of 1ms (1000 Hz) on any operation so
+/// that we never attempt to do a series of debug probe operations
+/// too fast. That can put the probe into a weird state.
+const SERVICE_TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 pub fn spawn(
     log_rtt_metrics: bool,
-    op_rx: mpsc::Receiver<Operation>,
-    op_tx_for_sessions: mpsc::SyncSender<Operation>,
+    op_rx: Receiver<Operation>,
+    op_tx_for_sessions: Sender<Operation>,
 ) -> io::Result<thread::JoinHandle<Result<(), Error>>> {
     let builder = thread::Builder::new().name("manager".into());
     builder.spawn(move || manager_thread(log_rtt_metrics, op_rx, op_tx_for_sessions))
@@ -57,94 +58,70 @@ pub fn spawn(
 
 fn manager_thread(
     log_rtt_metrics: bool,
-    op_rx: mpsc::Receiver<Operation>,
-    op_tx_for_sessions: mpsc::SyncSender<Operation>,
+    op_rx: Receiver<Operation>,
+    op_tx_for_sessions: Sender<Operation>,
 ) -> Result<(), Error> {
     info!("Starting manager");
 
-    let mut shutdown_sessions = HashSet::new();
-
     let mut mngr = Manager::new(log_rtt_metrics, op_tx_for_sessions);
+    let ticker = tick(SERVICE_TICK_INTERVAL);
 
     loop {
-        let Ok(op) = op_rx.recv() else {
-            info!("Channel closed");
-            break;
-        };
-        match op {
-            Operation::Shutdown => {
-                info!("Got shutdown request");
-                break;
-            }
-            Operation::ShutdownSession(id) => {
-                info!(%id, "Got shutdown session request");
-                shutdown_sessions.insert(id);
-                mngr.shutdown_session(id);
-                mngr.prune_sessions(false);
-            }
-            Operation::PruneInactiveSessions => {
-                debug!("Got prune inactive sessions request");
-                mngr.prune_sessions(false);
-            }
-            Operation::RecoverSession(recovery_state) => {
-                debug!(id = %recovery_state.proxy_session_id, "Recovering session");
-                mngr.prune_sessions(false);
-
-                if shutdown_sessions.remove(&recovery_state.proxy_session_id) {
-                    debug!("Ignore recovery due to shutdown");
-                    continue;
-                }
-
-                if let Err(e) =
-                    mngr.handle_new_session_req(SessionReq::Recovery(recovery_state.try_clone()?))
-                {
-                    warn!(id = %recovery_state.proxy_session_id, error = %e, "Session recovery failed");
-
-                    // TODO cfg or recovery thread with time handling
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-
-                    // Try again
-                    mngr.op_tx_for_sessions
-                        .send(Operation::RecoverSession(recovery_state))
-                        .ok();
-                }
-            }
-            Operation::HandleClient((mut client, client_addr)) => {
-                debug!(peer = %client_addr, "Waiting for config");
-                let config_res = {
-                    let mut de = serde_json::Deserializer::from_reader(&mut client);
-                    ProxySessionConfig::deserialize(&mut de)
+        select_biased! {
+            recv(op_rx) -> op_res => {
+                let Ok(op) = op_res else {
+                    info!("Channel closed");
+                    break;
                 };
-                let mut cloned_stream = client.try_clone()?;
-                let mut client_resp_stream = serde_json::Serializer::new(&mut cloned_stream);
-                match config_res {
-                    Ok(cfg) => {
-                        debug!(peer = %client_addr, "Process session config");
-                        trace!(?cfg);
+                match op {
+                    Operation::Shutdown => {
+                        debug!("Got shutdown request");
+                        break;
+                    }
+                    Operation::ShutdownSession(id) => {
+                        debug!(%id, "Got shutdown session request");
+                        mngr.shutdown_session(id);
+                    }
+                    Operation::HandleClient((mut client, client_addr)) => {
+                        debug!(peer = %client_addr, "Go client request, waiting for config");
+                        let config_res = {
+                            let mut de = serde_json::Deserializer::from_reader(&mut client);
+                            ProxySessionConfig::deserialize(&mut de)
+                        };
+                        let mut cloned_stream = client.try_clone()?;
+                        let mut client_resp_stream = serde_json::Serializer::new(&mut cloned_stream);
+                        match config_res {
+                            Ok(cfg) => {
+                                debug!(peer = %client_addr, "Process session config");
+                                trace!(?cfg);
 
-                        // The RTT sesssion thread will send the Ok response
-                        if let Err(e) = mngr.handle_new_session_req(SessionReq::New((cfg, client)))
-                        {
-                            warn!(peer = %client_addr, error = %e, "Dropping client due to error");
-                            let resp = ProxySessionStatus::error(e);
-                            if resp.serialize(&mut client_resp_stream).is_err() {
-                                warn!(peer = %client_addr, "Failed to send response");
+                                // The RTT sesssion will send the Ok response
+                                if let Err(e) = mngr.handle_new_session_req(cfg, client) {
+                                    warn!(peer = %client_addr, error = %e, "Dropping client due to error");
+                                    let resp = ProxySessionStatus::error(e);
+                                    if resp.serialize(&mut client_resp_stream).is_err() {
+                                        warn!(peer = %client_addr, "Failed to send response");
+                                    }
+                                }
+                                std::mem::drop(cloned_stream);
+                            }
+                            Err(e) => {
+                                warn!(peer = %client_addr, "Invalid session config");
+                                let resp = ProxySessionStatus::error(e);
+                                let _ignored = resp.serialize(&mut client_resp_stream).ok();
                             }
                         }
-                        std::mem::drop(cloned_stream);
-                    }
-                    Err(e) => {
-                        warn!(peer = %client_addr, "Invalid session config");
-                        let resp = ProxySessionStatus::error(e);
-                        let _ignored = resp.serialize(&mut client_resp_stream).ok();
                     }
                 }
+            }
+
+            recv(ticker) -> _ => {
+                mngr.service_probes();
             }
         }
     }
 
-    info!("Shutting down");
-    mngr.shutdown_blocking();
+    mngr.shutdown();
 
     Ok(())
 }
@@ -152,102 +129,69 @@ fn manager_thread(
 #[derive(Debug)]
 struct Manager {
     log_rtt_metrics: bool,
+    op_tx_for_sessions: Sender<Operation>,
     probe_states: HashMap<ProbeId, ProbeState>,
-    op_tx_for_sessions: mpsc::SyncSender<Operation>,
-    session_thread_names: HashMap<ProxySessionId, String>,
 }
 
 impl Manager {
-    fn new(log_rtt_metrics: bool, op_tx_for_sessions: mpsc::SyncSender<Operation>) -> Self {
+    fn new(log_rtt_metrics: bool, op_tx_for_sessions: Sender<Operation>) -> Self {
         Self {
             log_rtt_metrics,
-            probe_states: Default::default(),
             op_tx_for_sessions,
-            session_thread_names: Default::default(),
+            probe_states: Default::default(),
         }
     }
 
-    fn shutdown_blocking(&mut self) {
-        for session_state in self
-            .probe_states
-            .values()
-            .flat_map(|ps| ps.proxy_sessions.values())
-        {
-            session_state.interruptor.set();
+    fn shutdown(&mut self) {
+        info!("Shutting down");
+        let probe_states = std::mem::take(&mut self.probe_states);
+        for (_probe_id, mut probe_state) in probe_states.into_iter() {
+            probe_state.shutdown_all_rtt_sessions();
         }
-        self.prune_sessions(true);
     }
 
     fn shutdown_session(&mut self, id: ProxySessionId) {
-        if let Some(session_state) = self
+        if let Some(probe_state) = self
             .probe_states
             .values_mut()
-            .find_map(|ps| ps.proxy_sessions.get_mut(&id))
+            .find(|ps| ps.rtt_sessions.contains_key(&id))
         {
-            session_state.interruptor.set();
-            self.session_thread_names.remove(&id);
+            probe_state.shutdown_rtt_session(id);
         }
+        self.prune_inactive_probes();
     }
 
-    fn prune_sessions(&mut self, wait_for_session_shutdown: bool) {
-        for (probe_id, probe_state) in self.probe_states.iter_mut() {
-            // Remove finished proxy sessions
-            probe_state.proxy_sessions.retain(|id, state| {
-                if state
-                    .join_handle
-                    .as_ref()
-                    .map(|jh| jh.is_finished() || wait_for_session_shutdown)
-                    .unwrap_or(false)
-                {
-                    if let Some(join_handle) = state.join_handle.take() {
-                        debug!(probe = %probe_id, proxy_session_id = %id, "Pruning RTT session");
-                        let _ = join_handle.join().ok();
-                    }
-                }
-
-                // Only retain sessions that are still active
-                state.join_handle.is_some()
-            });
-        }
-
-        // Remove probes that no proxy sessions
-        self.probe_states.retain(|probe_id, state| {
-            if state.proxy_sessions.is_empty() {
-                debug!(probe = %probe_id, "Pruning probe");
+    fn prune_inactive_probes(&mut self) {
+        self.probe_states.retain(|id, state| {
+            if state.rtt_sessions.is_empty() {
+                debug!(probe = %id, "Pruning probe");
             }
-
-            !state.proxy_sessions.is_empty()
+            !state.rtt_sessions.is_empty()
         });
     }
 
-    fn handle_new_session_req(&mut self, req: SessionReq) -> Result<(), ManagerError> {
-        let (recovery_mode, response_already_sent, proxy_session_id, req_cfg, client) = match req {
-            SessionReq::New((cfg, c)) => (false, false, Uuid::new_v4(), cfg, c),
-            SessionReq::Recovery(recovery_state) => (
-                true,
-                recovery_state.response_already_sent,
-                recovery_state.proxy_session_id,
-                ProxySessionConfig {
-                    version: rtt_proxy::V1,
-                    probe: recovery_state.probe_cfg,
-                    target: recovery_state.target_cfg,
-                    rtt: recovery_state.rtt_cfg,
-                },
-                recovery_state.stream,
-            ),
-        };
+    fn service_probes(&mut self) {
+        for probe_state in self.probe_states.values_mut() {
+            probe_state.service();
+        }
+    }
 
-        let probe_info = Self::find_probe_info(&req_cfg.probe)?;
+    fn handle_new_session_req(
+        &mut self,
+        req_cfg: ProxySessionConfig,
+        client: TcpStream,
+    ) -> Result<(), ManagerError> {
+        self.prune_inactive_probes();
+
+        let probe_info = find_probe_info(&req_cfg.probe)?;
         let probe_id = ProbeId::from(&probe_info);
 
         if req_cfg.probe.force_exclusive {
-            if let Some(probe_state) = self.probe_states.get_mut(&probe_id) {
+            if let Some(mut probe_state) = self.probe_states.remove(&probe_id) {
                 debug!(probe = %probe_info, "Shutting down sessions for exclusive probe request");
-                probe_state.shutdown_sessions();
+                probe_state.shutdown_all_rtt_sessions();
             }
         }
-
-        self.prune_sessions(false);
 
         // Do initial setup if we haven't already done so for this probe
         let probe_state = match self.probe_states.entry(probe_id.clone()) {
@@ -260,180 +204,301 @@ impl Manager {
             }
             hash_map::Entry::Vacant(v) => {
                 debug!(probe = %probe_info, "Opening probe");
-                let session = Self::setup_probe(&probe_info, &req_cfg.probe)?;
-                v.insert(ProbeState {
-                    cfg: req_cfg.probe.clone(),
-                    session: Arc::new(FairMutex::new(session)),
-                    proxy_sessions: Default::default(),
-                })
+                let session = setup_probe(&probe_info, &req_cfg.probe)?;
+                v.insert(ProbeState::new(probe_info, req_cfg.probe, session))
             }
         };
 
         // Check if we already have an RTT session attached to the core at the
         // same control block address
-        if probe_state.proxy_sessions.values().any(|ps| {
-            (ps.target_cfg.core == req_cfg.target.core)
-                && (ps.rtt_cfg.control_block_address == req_cfg.rtt.control_block_address)
+        if probe_state.rtt_sessions.values().any(|rtt| {
+            (rtt.target_config().core == req_cfg.target.core)
+                && (rtt.rtt_config().control_block_address == req_cfg.rtt.control_block_address)
         }) {
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
 
-        // Persist thread names across recovery lifecycles
-        let thread_name = match self.session_thread_names.entry(proxy_session_id) {
-            hash_map::Entry::Occupied(o) => o.get().clone(),
-            hash_map::Entry::Vacant(v) => {
-                let core_thread_name_suffix = {
-                    let num_sessions_on_core = probe_state
-                        .proxy_sessions
-                        .values()
-                        .filter(|ps| ps.target_cfg.core == req_cfg.target.core)
-                        .count();
-                    if num_sessions_on_core == 0 {
-                        format!("{}", req_cfg.target.core)
-                    } else {
-                        format!("{}.{}", req_cfg.target.core, num_sessions_on_core)
-                    }
-                };
-                v.insert(format!(
-                    "{}::{}:{}",
-                    probe_id, probe_state.cfg.target, core_thread_name_suffix
-                ))
-                .clone()
+        let session_name = {
+            let suffix = if req_cfg.target.bootloader {
+                ":bl"
+            } else if req_cfg.target.bootloader_companion_application {
+                ":app"
+            } else {
+                ""
+            };
+            format!(
+                "{}:{}{}",
+                probe_state.cfg.target, req_cfg.target.core, suffix
+            )
+        };
+
+        let id = Uuid::new_v4();
+        let shared_state = probe_state.shared_state_for_core(req_cfg.target.core);
+        let probe_rs_session = match &mut probe_state.session {
+            ProbeSessionState::Active(session) => session,
+            ProbeSessionState::NeedsRecovered => {
+                warn!("Rejecting new client request to due probe being in recovery state");
+                return Err(ManagerError::ProbeInRecovery);
             }
         };
-
-        let session_interruptor = Interruptor::default();
-        let spawn_args = rtt_session::SpawnArgs {
-            proxy_session_id,
-            // NOTE: tracing_subscriber will indent to largest thread name,
-            // and you can't turn that off
-            // https://github.com/tokio-rs/tracing/issues/2465
-            thread_name,
-            probe_cfg: req_cfg.probe,
-            target_cfg: req_cfg.target.clone(),
-            rtt_cfg: req_cfg.rtt.clone(),
-            log_rtt_metrics: self.log_rtt_metrics,
-            recovery_mode,
-            response_already_sent,
-            interruptor: session_interruptor.clone(),
-            shutdown_channel: self.op_tx_for_sessions.clone(),
-            session: probe_state.session.clone(),
-            stream: client,
-        };
-
-        let join_handle = rtt_session::spawn(spawn_args)?;
-        probe_state.proxy_sessions.insert(
-            proxy_session_id,
-            RttSessionState {
-                target_cfg: req_cfg.target,
-                rtt_cfg: req_cfg.rtt,
-                interruptor: session_interruptor,
-                join_handle: Some(join_handle),
-            },
-        );
+        let rtt_session = RttSession::new(
+            id,
+            session_name,
+            req_cfg.target,
+            req_cfg.rtt,
+            self.log_rtt_metrics,
+            shared_state,
+            self.op_tx_for_sessions.clone(),
+            client,
+            probe_rs_session,
+        )?;
+        probe_state.add_rtt_session(rtt_session);
 
         Ok(())
     }
+}
 
-    fn find_probe_info(cfg: &ProbeConfig) -> Result<DebugProbeInfo, ManagerError> {
-        let available_probes = available_probes();
-
-        for (idx, probe) in available_probes.iter().enumerate() {
-            debug!(probe_idx = idx, probe = %probe, "Discovered debug probe");
-        }
-
-        let probe_info = if let Some(selector) = cfg.probe_selector.as_deref() {
-            let selector = DebugProbeSelector::from_str(selector)?;
-            let probe_id = ProbeId::from(&selector);
-            debug!(%selector, "Searching for debug probe");
-
-            // Does this probe exist?
-            available_probes
-                .into_iter()
-                .find(|p| ProbeId::from(p) == probe_id)
-                .ok_or(ManagerError::ProbeNotFound(selector))?
-        } else {
-            debug!("Using the first available debug probe");
-
-            // We support omitting the selector if there's only a single
-            // available probe
-            if available_probes.len() > 1 {
-                return Err(ManagerError::NoProbeSelector);
-            } else if let Some(first_probe) = available_probes.first() {
-                first_probe.clone()
-            } else {
-                return Err(ManagerError::NoProbesAvailable);
-            }
-        };
-
-        Ok(probe_info)
-    }
-
-    fn setup_probe(
-        probe_info: &DebugProbeInfo,
-        cfg: &ProbeConfig,
-    ) -> Result<Session, ManagerError> {
-        let wire_proto = WireProtocol::from_str(&cfg.protocol)
-            .map_err(|_| ManagerError::WireProtocol(cfg.protocol.clone()))?;
-
-        let mut probe = probe_info.open()?;
-
-        debug!(protocol = %wire_proto, speed_khz = cfg.speed_khz, "Configuring probe");
-        probe.select_protocol(wire_proto)?;
-        probe.set_speed(cfg.speed_khz)?;
-
-        debug!(
-            target = %cfg.target,
-            under_reset = cfg.attach_under_reset,
-            "Attaching to chip"
-        );
-
-        let target_selector = match &cfg.target {
-            rtt_proxy::Target::Auto => TargetSelector::Auto,
-            rtt_proxy::Target::Specific(s) => TargetSelector::Unspecified(s.to_owned()),
-        };
-
-        let session = if cfg.attach_under_reset {
-            probe.attach_under_reset(target_selector, Permissions::default())?
-        } else {
-            probe.attach(target_selector, Permissions::default())?
-        };
-
-        Ok(session)
-    }
+#[derive(Debug)]
+enum ProbeSessionState {
+    Active(probe_rs::Session),
+    NeedsRecovered,
 }
 
 #[derive(Debug)]
 struct ProbeState {
+    info: DebugProbeInfo,
     cfg: ProbeConfig,
-    session: Arc<FairMutex<Session>>,
-    proxy_sessions: HashMap<ProxySessionId, RttSessionState>,
+    session: ProbeSessionState,
+    per_core_shared_state: HashMap<u32, SharedStateRc>,
+    rtt_sessions: HashMap<ProxySessionId, RttSession>,
+    schedule: Vec<ProxySessionId>,
+    next_schedule_idx: usize,
+    num_sessions_needing_serviced_before_recovery_rentry: usize,
+    recovery_limiter: RateLimiter,
+    recovery_check_limiter: RateLimiter,
 }
 
 impl ProbeState {
-    fn shutdown_sessions(&mut self) {
-        for state in self.proxy_sessions.values() {
-            state.interruptor.set();
+    const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+    const RECOVERY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+    fn new(info: DebugProbeInfo, cfg: ProbeConfig, session: probe_rs::Session) -> Self {
+        Self {
+            info,
+            cfg,
+            session: ProbeSessionState::Active(session),
+            per_core_shared_state: Default::default(),
+            rtt_sessions: Default::default(),
+            schedule: Default::default(),
+            next_schedule_idx: 0,
+            num_sessions_needing_serviced_before_recovery_rentry: 0,
+            recovery_limiter: RateLimiter::new(Self::RECOVERY_RETRY_INTERVAL),
+            recovery_check_limiter: RateLimiter::new(Self::RECOVERY_CHECK_INTERVAL),
+        }
+    }
+
+    fn shutdown_all_rtt_sessions(&mut self) {
+        let rtt_sessions = std::mem::take(&mut self.rtt_sessions);
+        if let ProbeSessionState::Active(session) = &mut self.session {
+            for (_id, mut rtt_session) in rtt_sessions.into_iter() {
+                rtt_session.shutdown(session);
+            }
+        }
+    }
+
+    fn shutdown_rtt_session(&mut self, id: ProxySessionId) {
+        if let Some(mut rtt_session) = self.rtt_sessions.remove(&id) {
+            if let ProbeSessionState::Active(session) = &mut self.session {
+                rtt_session.shutdown(session);
+            }
+
+            // Remove it from the scheduler
+            if let Some(idx) = self.schedule.iter().position(|sid| *sid == id) {
+                self.schedule.remove(idx);
+                // Reset the scheduler
+                // NOTE: could be smarter about this and preserve the next item
+                self.next_schedule_idx = 0;
+            }
+        }
+    }
+
+    fn shared_state_for_core(&mut self, core: u32) -> SharedStateRc {
+        self.per_core_shared_state
+            .entry(core)
+            .or_insert(SharedState::new_rc())
+            .clone()
+    }
+
+    fn add_rtt_session(&mut self, rtt_session: RttSession) {
+        let id = rtt_session.id();
+        self.rtt_sessions.insert(id, rtt_session);
+        self.schedule.push(id);
+    }
+
+    fn enter_recovery(&mut self) {
+        debug!(probe = %self.info, "Entering recovery");
+        let debug_session = std::mem::replace(&mut self.session, ProbeSessionState::NeedsRecovered);
+        std::mem::drop(debug_session);
+
+        for shared_state in self.per_core_shared_state.values() {
+            shared_state.reset();
         }
 
-        let mut proxy_sessions = HashMap::new();
-        std::mem::swap(&mut self.proxy_sessions, &mut proxy_sessions);
+        self.next_schedule_idx = 0;
+        self.num_sessions_needing_serviced_before_recovery_rentry = self.rtt_sessions.len();
+    }
 
-        for (id, mut state) in proxy_sessions.into_iter() {
-            if let Some(join_handle) = state.join_handle.take() {
-                debug!(proxy_session_id = %id, "Shutting down RTT session");
-                let _ = join_handle.join().ok();
+    fn recover(&mut self) {
+        if self.recovery_limiter.check() {
+            match setup_probe(&self.info, &self.cfg) {
+                Err(e) => {
+                    warn!(probe = %self.info, error = %e, "Debug probe recovery failed");
+                }
+                Ok(session) => {
+                    debug!(probe = %self.info, "Debug probe recovery succeeded");
+                    self.session = ProbeSessionState::Active(session);
+                }
+            }
+        }
+    }
+
+    fn service(&mut self) {
+        match &mut self.session {
+            ProbeSessionState::NeedsRecovered => {
+                self.recover();
+                return;
+            }
+            ProbeSessionState::Active(session) => {
+                if let Some(rtt_session) = self
+                    .schedule
+                    .get(self.next_schedule_idx)
+                    .and_then(|id| self.rtt_sessions.get_mut(id))
+                {
+                    rtt_session.update(session);
+                    self.num_sessions_needing_serviced_before_recovery_rentry = self
+                        .num_sessions_needing_serviced_before_recovery_rentry
+                        .saturating_sub(1);
+                }
+            }
+        }
+
+        // Increment the scheduler
+        self.next_schedule_idx += 1;
+        if self.next_schedule_idx >= self.schedule.len() {
+            self.next_schedule_idx = 0;
+        }
+
+        // Do a heuristic check to see if the debug probe
+        // needs to be re-attached (likely due to a target power cycle).
+        // The debug sequences need to be re-run when that occurs.
+        //
+        // We only due this if any of the sessions have auto recovery enabled
+        // and they're not all shutdown.
+        if self.recovery_check_limiter.check()
+            && self.num_sessions_needing_serviced_before_recovery_rentry == 0
+        {
+            // We've serviced every RTT session at least once following
+            // a previous recovery
+
+            let any_session_using_recovery = self
+                .rtt_sessions
+                .values()
+                .any(|rtt| rtt.target_config().auto_recover && !rtt.is_shutdown());
+
+            if !self.rtt_sessions.is_empty() && any_session_using_recovery {
+                // We have sessions with auto recover enabled
+
+                let any_sessions_running = self.rtt_sessions.values().any(|rtt| rtt.is_running());
+                let any_session_stopped_due_to_core_attach = self
+                    .rtt_sessions
+                    .values()
+                    .any(|rtt| rtt.is_stopped_due_to_core_attach());
+
+                // No sessions are running, and at least 1 is stopped due to a core attach error
+                if !any_sessions_running && any_session_stopped_due_to_core_attach {
+                    debug!(probe = %self.info, "Debug probe status failed the heuristic check");
+                    self.enter_recovery();
+                }
             }
         }
     }
 }
 
-#[derive(Debug)]
-struct RttSessionState {
-    target_cfg: TargetConfig,
-    rtt_cfg: RttConfig,
-    interruptor: Interruptor,
-    join_handle: Option<rtt_session::JoinHandle>,
+fn find_probe_info(cfg: &ProbeConfig) -> Result<DebugProbeInfo, ManagerError> {
+    let available_probes = available_probes();
+
+    for (idx, probe) in available_probes.iter().enumerate() {
+        debug!(probe_idx = idx, probe = %probe, "Discovered debug probe");
+    }
+
+    if let Some(selector) = cfg.probe_selector.as_deref() {
+        let selector = DebugProbeSelector::from_str(selector)?;
+        let probe_id = ProbeId::from(&selector);
+        debug!(%selector, "Searching for debug probe");
+
+        // Does this probe exist?
+        Ok(available_probes
+            .into_iter()
+            .find(|p| ProbeId::from(p) == probe_id)
+            .ok_or(ManagerError::ProbeNotFound(selector))?)
+    } else {
+        debug!("Using the first available debug probe");
+
+        // We support omitting the selector if there's only a single
+        // available probe
+        if available_probes.len() > 1 {
+            Err(ManagerError::NoProbeSelector)
+        } else if let Some(first_probe) = available_probes.first() {
+            Ok(first_probe.clone())
+        } else {
+            Err(ManagerError::NoProbesAvailable)
+        }
+    }
+}
+
+fn setup_probe(
+    probe_info: &DebugProbeInfo,
+    cfg: &ProbeConfig,
+) -> Result<probe_rs::Session, ManagerError> {
+    let wire_proto = WireProtocol::from_str(&cfg.protocol)
+        .map_err(|_| ManagerError::WireProtocol(cfg.protocol.clone()))?;
+
+    let mut probe = probe_info.open()?;
+
+    debug!(protocol = %wire_proto, speed_khz = cfg.speed_khz, "Configuring probe");
+    probe.select_protocol(wire_proto)?;
+    probe.set_speed(cfg.speed_khz)?;
+
+    debug!(
+        target = %cfg.target,
+        under_reset = cfg.attach_under_reset,
+        "Attaching to chip"
+    );
+
+    let target_selector = match &cfg.target {
+        rtt_proxy::Target::Auto => TargetSelector::Auto,
+        rtt_proxy::Target::Specific(s) => TargetSelector::Unspecified(s.to_owned()),
+    };
+
+    let target_voltage = probe.get_target_voltage()?;
+
+    let vtref_string = target_voltage
+        .map(|v| format!("{}", v))
+        .unwrap_or_else(|| "NA".to_string());
+    debug!(target_voltage = vtref_string);
+
+    // Use target voltage to check for target powered on
+    if target_voltage.unwrap_or(TARGET_VOLTAGE_POWER_ON_THRESHOLD)
+        < TARGET_VOLTAGE_POWER_ON_THRESHOLD
+    {
+        return Err(ManagerError::TargetNotPowered);
+    }
+
+    if cfg.attach_under_reset {
+        Ok(probe.attach_under_reset(target_selector, Permissions::default())?)
+    } else {
+        Ok(probe.attach(target_selector, Permissions::default())?)
+    }
 }
 
 fn available_probes() -> Vec<DebugProbeInfo> {
@@ -506,4 +571,10 @@ enum ManagerError {
 
     #[error("An RTT session is already attached to this target's core at the same control block address")]
     RttSessionAlreadyStarted,
+
+    #[error("Target not powered (VTref less than threshold)")]
+    TargetNotPowered,
+
+    #[error("The debug probe is currently in recovery mode")]
+    ProbeInRecovery,
 }
