@@ -225,7 +225,7 @@ fn do_main() -> Result<(), Box<dyn std::error::Error>> {
         let mut file = File::open(elf_file)?;
         if let Some(rtt_addr) = get_rtt_symbol(&mut file) {
             info!(
-                rtt_addr = format_args!("0x:{:X}", rtt_addr),
+                rtt_addr = format_args!("0x{:X}", rtt_addr),
                 "Found RTT symbol"
             );
             Some(rtt_addr)
@@ -359,7 +359,11 @@ fn start_session_retry_loop(
     while Instant::now().duration_since(start) <= timeout {
         match start_session(remote, cfg) {
             Ok(s) => return Ok(s),
-            Err(_) => continue,
+            Err(e) => {
+                debug!(error = %e, "Failed to start session");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         }
     }
     start_session(remote, cfg)
