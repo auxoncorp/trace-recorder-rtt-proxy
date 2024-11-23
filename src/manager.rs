@@ -258,6 +258,7 @@ impl Manager {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ProbeSessionState {
     Active(probe_rs::Session),
