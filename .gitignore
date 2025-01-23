@@ -1,2 +1,4 @@
 /target
 rtt.psf
+/bazel-*
+MODULE.bazel.lock
