@@ -7,9 +7,9 @@ rust.toolchain(edition = "2021")
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
 crate.from_cargo(
-    name = "crates",
+    name = "rtt-proxy-crates",
     cargo_lockfile = "//:Cargo.lock",
     manifests = ["//:Cargo.toml",
       "//:rtt-proxy/Cargo.toml"],  
 )
-use_repo(crate, "crates")
+use_repo(crate, "rtt-proxy-crates")

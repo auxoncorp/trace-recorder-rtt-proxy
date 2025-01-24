@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("@crates//:defs.bzl", "all_crate_deps")
+load("@rtt-proxy-crates//:defs.bzl", "all_crate_deps")
 
 rust_binary(
     name = "trc-rtt-proxy",
@@ -20,10 +20,10 @@ rust_binary(
     deps = all_crate_deps(normal = True) + [
         "//rtt-proxy:rtt-proxy",
         # must include dev-dependencies explicitly for examples
-        "@crates//:humantime",
-        "@crates//:url",
-        "@crates//:clap-num",
-        "@crates//:goblin",
+        "@rtt-proxy-crates//:humantime",
+        "@rtt-proxy-crates//:url",
+        "@rtt-proxy-crates//:clap-num",
+        "@rtt-proxy-crates//:goblin",
     ],
     visibility = ["//visibility:public"],
 )

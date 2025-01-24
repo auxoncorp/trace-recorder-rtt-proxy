@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@crates//:defs.bzl", "all_crate_deps", "aliases")
+load("@rtt-proxy-crates//:defs.bzl", "all_crate_deps", "aliases")
 
 package(default_visibility = ["//visibility:public"])
 
