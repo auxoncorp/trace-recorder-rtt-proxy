@@ -494,18 +494,23 @@ impl RttSession {
             "Found RTT control block"
         );
 
-        if self.rtt_cfg.up_channel as usize > rtt.up_channels.len() {
-            return Err(Error::UpChannelInvalid(self.rtt_cfg.up_channel as _));
-        }
-        if self.rtt_cfg.down_channel as usize > rtt.down_channels.len() {
-            return Err(Error::DownChannelInvalid(self.rtt_cfg.down_channel as _));
-        }
+        let up_ch_index = rtt
+            .up_channels()
+            .iter()
+            .position(|ch| ch.number() == self.rtt_cfg.up_channel as usize)
+            .ok_or_else(|| Error::UpChannelInvalid(self.rtt_cfg.up_channel as _))?;
 
-        let up_channel = rtt.up_channels.remove(self.rtt_cfg.up_channel as _);
+        let down_ch_index = rtt
+            .down_channels()
+            .iter()
+            .position(|ch| ch.number() == self.rtt_cfg.down_channel as usize)
+            .ok_or_else(|| Error::DownChannelInvalid(self.rtt_cfg.down_channel as _))?;
+
+        let up_channel = rtt.up_channels.remove(up_ch_index);
         let up_channel_mode = up_channel.mode(&mut core)?;
         debug!(channel = up_channel.number(), mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
 
-        let down_channel = rtt.down_channels.remove(self.rtt_cfg.down_channel as _);
+        let down_channel = rtt.down_channels.remove(down_ch_index);
         debug!(
             channel = down_channel.number(),
             buffer_size = down_channel.buffer_size(),
