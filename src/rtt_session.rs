@@ -238,10 +238,10 @@ impl RttSession {
 
                 // Send the stop command if we can
                 if let RttSessionState::Run(rtt_handles) = &self.state {
-                    if !self.rtt_cfg.disable_control_plane {
+                    if let Some(down_ch) = rtt_handles.down_channel.as_ref() {
                         debug!("Sending stop command");
                         let cmd = TrcCommand::StopTracing.to_wire_bytes();
-                        rtt_handles.down_channel.write(&mut core, &cmd).ok();
+                        down_ch.write(&mut core, &cmd).ok();
                     }
                 }
 
@@ -512,24 +512,24 @@ impl RttSession {
             .position(|ch| ch.number() == self.rtt_cfg.up_channel as usize)
             .ok_or_else(|| Error::UpChannelInvalid(self.rtt_cfg.up_channel as _))?;
 
-        let down_ch_index = rtt
-            .down_channels()
-            .iter()
-            .position(|ch| ch.number() == self.rtt_cfg.down_channel as usize)
-            .ok_or_else(|| Error::DownChannelInvalid(self.rtt_cfg.down_channel as _))?;
-
         let up_channel = rtt.up_channels.remove(up_ch_index);
         let up_channel_mode = up_channel.mode(&mut core)?;
         debug!(channel = up_channel.number(), mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
 
-        let down_channel = rtt.down_channels.remove(down_ch_index);
-        debug!(
-            channel = down_channel.number(),
-            buffer_size = down_channel.buffer_size(),
-            "Opened down channel"
-        );
+        let down_channel = if !self.rtt_cfg.disable_control_plane {
+            let down_ch_index = rtt
+                .down_channels()
+                .iter()
+                .position(|ch| ch.number() == self.rtt_cfg.down_channel as usize)
+                .ok_or_else(|| Error::DownChannelInvalid(self.rtt_cfg.down_channel as _))?;
 
-        if !self.rtt_cfg.disable_control_plane {
+            let down_channel = rtt.down_channels.remove(down_ch_index);
+            debug!(
+                channel = down_channel.number(),
+                buffer_size = down_channel.buffer_size(),
+                "Opened down channel"
+            );
+
             if self.rtt_cfg.restart {
                 debug!("Sending stop command");
                 let cmd = TrcCommand::StopTracing.to_wire_bytes();
@@ -540,7 +540,11 @@ impl RttSession {
             debug!("Sending start command");
             let cmd = TrcCommand::StartTracing.to_wire_bytes();
             down_channel.write(&mut core, &cmd)?;
-        }
+
+            Some(down_channel)
+        } else {
+            None
+        };
 
         // Auxilary cores get vector catching enabled after we know they're running
         if !self.target_cfg.bootloader && !self.target_cfg.bootloader_companion_application {
@@ -665,7 +669,7 @@ pub struct RttHandles {
     /// RTT up (target to host) channel
     up_channel: UpChannel,
     /// RTT down (host to target) channel
-    down_channel: DownChannel,
+    down_channel: Option<DownChannel>,
 }
 
 #[derive(Debug)]
