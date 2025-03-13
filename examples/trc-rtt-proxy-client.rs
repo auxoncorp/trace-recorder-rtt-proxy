@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 /// Connects to an existing trace recorder RTT proxy server and writes RTT binary data to file
@@ -382,7 +382,13 @@ fn start_session(
 
     // Read response
     let mut de = serde_json::Deserializer::from_reader(&mut sock);
-    let status = ProxySessionStatus::deserialize(&mut de)?;
+    let status = match ProxySessionStatus::deserialize(&mut de) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed read session status");
+            return Err(e.into());
+        }
+    };
 
     match status {
         ProxySessionStatus::Started(id) => {

@@ -315,6 +315,18 @@ impl RttSession {
                 if self.target_cfg.auto_recover && !matches!(e, Error::ClientDisconnected) {
                     self.stop(session, StoppedReason::Error(e));
                 } else {
+                    // Send an error response if we haven't sent the response yet
+                    if !self.client_response_sent {
+                        debug!("Sending client response");
+
+                        let resp = ProxySessionStatus::error(e);
+                        let mut se = serde_json::Serializer::new(&mut self.stream);
+                        if resp.serialize(&mut se).is_err() {
+                            warn!("Failed to send response");
+                        }
+                        self.client_response_sent = true;
+                    }
+
                     self.shutdown(session);
                 }
             }
