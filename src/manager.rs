@@ -83,7 +83,7 @@ fn manager_thread(
                         mngr.shutdown_session(id);
                     }
                     Operation::HandleClient((mut client, client_addr)) => {
-                        debug!(peer = %client_addr, "Go client request, waiting for config");
+                        debug!(peer = %client_addr, "Got client request, waiting for config");
                         let config_res = {
                             let mut de = serde_json::Deserializer::from_reader(&mut client);
                             ProxySessionConfig::deserialize(&mut de)
@@ -210,10 +210,11 @@ impl Manager {
         };
 
         // Check if we already have an RTT session attached to the core at the
-        // same control block address
+        // same control block address, and same up channel
         if probe_state.rtt_sessions.values().any(|rtt| {
             (rtt.target_config().core == req_cfg.target.core)
                 && (rtt.rtt_config().control_block_address == req_cfg.rtt.control_block_address)
+                && (rtt.rtt_config().up_channel == req_cfg.rtt.up_channel)
         }) {
             return Err(ManagerError::RttSessionAlreadyStarted);
         }
@@ -570,7 +571,7 @@ enum ManagerError {
     #[error("Encountered an error with the debug probe. {0}")]
     DebugProbe(#[from] probe_rs::probe::DebugProbeError),
 
-    #[error("An RTT session is already attached to this target's core at the same control block address")]
+    #[error("An RTT session is already attached to this target's core at the same control block address and up channel")]
     RttSessionAlreadyStarted,
 
     #[error("Target not powered (VTref less than threshold)")]
